@@ -1,0 +1,35 @@
+name: Go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go-version: ['1.23', '1.24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Build FUSE binary
+        run: go build -v -o glimpse .
+
+      - name: Build MCP server
+        run: go build -v -o glimpse-mcp ./cmd/glimpse-mcp
+
+      - name: Run tests
+        run: go test -v -race ./...
+
+      - name: Vet
+        run: go vet ./...
