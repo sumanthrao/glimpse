@@ -2,6 +2,11 @@
 // the object store. Zero external dependencies — just the Go stdlib and the
 // git CLI you already have installed. All reads are cached in memory.
 //
+// Optimizations:
+//   - Persistent git cat-file --batch process for blob reads (no process spawn per read)
+//   - Tree cache: ls-tree results are cached for the session (fixed ref = immutable trees)
+//   - Blob cache: file contents cached after first read
+//
 // Usage:
 //
 //	go build -o glimpse-mcp ./cmd/glimpse-mcp
@@ -13,9 +18,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -70,14 +77,94 @@ type contentBlock struct {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent git cat-file --batch reader
+// ---------------------------------------------------------------------------
+
+type batchReader struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+	mu     sync.Mutex
+}
+
+func newBatchReader(repoDir string) (*batchReader, error) {
+	cmd := exec.Command("git", "-C", repoDir, "cat-file", "--batch")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &batchReader{
+		cmd:    cmd,
+		stdin:  stdin,
+		stdout: bufio.NewReaderSize(stdout, 1<<20),
+	}, nil
+}
+
+// Read fetches an object by specifier (e.g. "HEAD:path/to/file").
+// Returns the raw content bytes. Thread-safe.
+func (b *batchReader) Read(spec string) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if _, err := fmt.Fprintf(b.stdin, "%s\n", spec); err != nil {
+		return nil, fmt.Errorf("write to cat-file: %w", err)
+	}
+
+	header, err := b.stdout.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read header: %w", err)
+	}
+	header = strings.TrimSpace(header)
+
+	if strings.HasSuffix(header, " missing") {
+		return nil, fmt.Errorf("not found")
+	}
+
+	fields := strings.Fields(header)
+	if len(fields) < 3 {
+		return nil, fmt.Errorf("unexpected header: %s", header)
+	}
+
+	size, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return nil, fmt.Errorf("bad size in header: %s", header)
+	}
+
+	// content is <size> bytes followed by a trailing LF
+	buf := make([]byte, size+1)
+	if _, err := io.ReadFull(b.stdout, buf); err != nil {
+		return nil, fmt.Errorf("read content: %w", err)
+	}
+
+	return buf[:size], nil
+}
+
+func (b *batchReader) Close() {
+	b.stdin.Close()
+	b.cmd.Wait()
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
 type server struct {
 	repoDir string
 	ref     string
-	mu      sync.Mutex
-	cache   map[string][]byte
+
+	mu        sync.Mutex
+	blobCache map[string][]byte
+	treeCache map[string]string
+
+	batch *batchReader
 }
 
 func main() {
@@ -108,7 +195,19 @@ func main() {
 		die("%s is not a git repository", abs)
 	}
 
-	s := &server{repoDir: abs, ref: *ref, cache: make(map[string][]byte)}
+	batch, err := newBatchReader(abs)
+	if err != nil {
+		die("start cat-file --batch: %v", err)
+	}
+	defer batch.Close()
+
+	s := &server{
+		repoDir:   abs,
+		ref:       *ref,
+		blobCache: make(map[string][]byte),
+		treeCache: make(map[string]string),
+		batch:     batch,
+	}
 
 	fmt.Fprintf(os.Stderr, "glimpse MCP server (zero deps, git CLI)\n")
 	fmt.Fprintf(os.Stderr, "  repo: %s\n", abs)
@@ -131,7 +230,7 @@ func main() {
 		}
 
 		if len(req.ID) == 0 || string(req.ID) == "null" {
-			continue // notification, no response needed
+			continue
 		}
 
 		resp := response{JSONRPC: "2.0", ID: req.ID}
@@ -254,33 +353,35 @@ func (s *server) dispatchTool(raw json.RawMessage) toolResult {
 }
 
 // ---------------------------------------------------------------------------
-// Tool implementations — all backed by git CLI
+// Tool implementations
 // ---------------------------------------------------------------------------
 
-// listDirectory runs `git ls-tree -l <ref> [-- path/]` and formats the output.
+// listDirectory runs `git ls-tree -l` with results cached for the session.
 func (s *server) listDirectory(path string) toolResult {
-	args := []string{"-C", s.repoDir, "ls-tree", "-l", s.ref}
-	if path != "" && path != "." {
-		path = strings.TrimSuffix(path, "/")
-		args = append(args, "--", path+"/")
-	}
+	path = normPath(path)
+	cacheKey := "ls:" + path
 
-	out, err := gitCmd(args...)
+	raw, err := s.cachedTree(cacheKey, func() (string, error) {
+		args := []string{"-C", s.repoDir, "ls-tree", "-l", s.ref}
+		if path != "" {
+			args = append(args, "--", path+"/")
+		}
+		return gitCmd(args...)
+	})
 	if err != nil {
 		return errResult(fmt.Sprintf("not found: %s", path))
 	}
 
 	var sb strings.Builder
 	prefix := ""
-	if path != "" && path != "." {
+	if path != "" {
 		prefix = path + "/"
 	}
 
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
 		if line == "" {
 			continue
 		}
-		// format: <mode> <type> <hash> <size>\t<name>
 		tab := strings.SplitN(line, "\t", 2)
 		if len(tab) != 2 {
 			continue
@@ -303,29 +404,29 @@ func (s *server) listDirectory(path string) toolResult {
 	return textResult(sb.String())
 }
 
-// readFile runs `git show <ref>:<path>` and caches the result.
+// readFile uses the persistent cat-file --batch process, with blob caching.
 func (s *server) readFile(path string) toolResult {
 	if path == "" {
 		return errResult("path is required")
 	}
 
 	s.mu.Lock()
-	if cached, ok := s.cache[path]; ok {
+	if cached, ok := s.blobCache[path]; ok {
 		s.mu.Unlock()
 		return textResult(string(cached))
 	}
 	s.mu.Unlock()
 
-	out, err := exec.Command("git", "-C", s.repoDir, "show", s.ref+":"+path).Output()
+	data, err := s.batch.Read(s.ref + ":" + path)
 	if err != nil {
 		return errResult(fmt.Sprintf("not found: %s", path))
 	}
 
 	s.mu.Lock()
-	s.cache[path] = out
+	s.blobCache[path] = data
 	s.mu.Unlock()
 
-	return textResult(string(out))
+	return textResult(string(data))
 }
 
 // writeFile writes content to the worktree and invalidates the cache.
@@ -348,24 +449,27 @@ func (s *server) writeFile(path, content string) toolResult {
 	}
 
 	s.mu.Lock()
-	delete(s.cache, path)
+	delete(s.blobCache, path)
 	s.mu.Unlock()
 
 	return textResult(fmt.Sprintf("wrote %d bytes to %s", len(content), path))
 }
 
-// fileInfo runs `git ls-tree -l <ref> -- <path>` to get metadata.
+// fileInfo uses cached ls-tree results to get metadata.
 func (s *server) fileInfo(path string) toolResult {
 	if path == "" {
 		return errResult("path is required")
 	}
 
-	out, err := gitCmd("-C", s.repoDir, "ls-tree", "-l", s.ref, "--", path)
-	if err != nil || strings.TrimSpace(out) == "" {
+	cacheKey := "info:" + path
+	raw, err := s.cachedTree(cacheKey, func() (string, error) {
+		return gitCmd("-C", s.repoDir, "ls-tree", "-l", s.ref, "--", path)
+	})
+	if err != nil || strings.TrimSpace(raw) == "" {
 		return errResult(fmt.Sprintf("not found: %s", path))
 	}
 
-	line := strings.TrimSpace(out)
+	line := strings.TrimSpace(raw)
 	tab := strings.SplitN(line, "\t", 2)
 	if len(tab) != 2 {
 		return errResult("unexpected git output")
@@ -391,7 +495,7 @@ func (s *server) fileInfo(path string) toolResult {
 	return textResult(fmt.Sprintf("type: file\npath: %s\nsize: %s bytes\nmode: %s", path, meta[3], mode))
 }
 
-// grep runs `git grep -n -I <pattern> <ref> [-- path]`.
+// grep runs `git grep` (still spawns a process — grep is inherently variable).
 func (s *server) grep(pattern, path string) toolResult {
 	if pattern == "" {
 		return errResult("pattern is required")
@@ -407,7 +511,6 @@ func (s *server) grep(pattern, path string) toolResult {
 		return textResult("no matches found")
 	}
 
-	// strip the ref prefix from each line: "HEAD:path:line" → "path:line"
 	prefix := s.ref + ":"
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 	var sb strings.Builder
@@ -422,6 +525,36 @@ func (s *server) grep(pattern, path string) toolResult {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// cachedTree returns a cached ls-tree result or calls fn and caches it.
+func (s *server) cachedTree(key string, fn func() (string, error)) (string, error) {
+	s.mu.Lock()
+	if cached, ok := s.treeCache[key]; ok {
+		s.mu.Unlock()
+		return cached, nil
+	}
+	s.mu.Unlock()
+
+	result, err := fn()
+	if err != nil {
+		return "", err
+	}
+
+	s.mu.Lock()
+	s.treeCache[key] = result
+	s.mu.Unlock()
+
+	return result, nil
+}
+
+func normPath(path string) string {
+	path = strings.TrimPrefix(path, "/")
+	path = strings.TrimSuffix(path, "/")
+	if path == "." {
+		return ""
+	}
+	return path
+}
 
 func textResult(text string) toolResult {
 	return toolResult{Content: []contentBlock{{Type: "text", Text: text}}}
