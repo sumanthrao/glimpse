@@ -2,16 +2,21 @@
 // the object store. Zero external dependencies — just the Go stdlib and the
 // git CLI you already have installed. All reads are cached in memory.
 //
+// Modes:
+//   - Single repo:  glimpse-mcp --repo /path/to/repo [--index]
+//   - Multi repo:   glimpse-mcp  (agents call open_repo dynamically)
+//
 // Optimizations:
 //   - Persistent git cat-file --batch process for blob reads (no process spawn per read)
 //   - Tree cache: ls-tree results are cached for the session (fixed ref = immutable trees)
 //   - Blob cache: file contents cached after first read
-//   - Trigram index (--index): pre-built in-memory index for sub-10ms grep
+//   - Trigram index: pre-built in-memory index for sub-10ms grep (always on for open_repo)
 //
 // Usage:
 //
 //	go build -o glimpse-mcp ./cmd/glimpse-mcp
-//	echo '...' | ./glimpse-mcp --repo /path/to/repo
+//	echo '...' | ./glimpse-mcp                        # multi-repo mode
+//	echo '...' | ./glimpse-mcp --repo /path/to/repo   # single-repo mode
 package main
 
 import (
@@ -113,8 +118,6 @@ func newBatchReader(repoDir string) (*batchReader, error) {
 	}, nil
 }
 
-// Read fetches an object by specifier (e.g. "HEAD:path/to/file").
-// Returns the raw content bytes. Thread-safe.
 func (b *batchReader) Read(spec string) ([]byte, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -143,7 +146,6 @@ func (b *batchReader) Read(spec string) ([]byte, error) {
 		return nil, fmt.Errorf("bad size in header: %s", header)
 	}
 
-	// content is <size> bytes followed by a trailing LF
 	buf := make([]byte, size+1)
 	if _, err := io.ReadFull(b.stdout, buf); err != nil {
 		return nil, fmt.Errorf("read content: %w", err)
@@ -158,130 +160,87 @@ func (b *batchReader) Close() {
 }
 
 // ---------------------------------------------------------------------------
-// Server
+// Server — handles one repo session
 // ---------------------------------------------------------------------------
 
 type server struct {
 	repoDir string
 	ref     string
+	bare    bool // true if opened via bare clone (no worktree)
 
 	mu        sync.Mutex
 	blobCache map[string][]byte
 	treeCache map[string]string
 
 	batch *batchReader
-	index *trigramIndex // nil if --index not used
+	index *trigramIndex
 }
 
-func main() {
-	repo := flag.String("repo", "", "Path to git repository (auto-detected from cwd if omitted)")
-	ref := flag.String("ref", "HEAD", "Git ref to serve (branch, tag, commit)")
-	indexFlag := flag.Bool("index", false, "Build a trigram index on startup for sub-10ms grep")
-	flag.Parse()
-
-	if *repo == "" {
-		dir, _ := os.Getwd()
-		for {
-			if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-				*repo = dir
-				break
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				die("not inside a git repo and --repo not specified")
-			}
-			dir = parent
-		}
+func (s *server) Close() {
+	if s.batch != nil {
+		s.batch.Close()
 	}
+}
 
-	abs, err := filepath.Abs(*repo)
+// openServer creates a server for the given repo directory.
+// If buildIndex is true, a trigram index is built on open.
+func openServer(repoDir, ref string, bare, buildIndex bool) (*server, error) {
+	batch, err := newBatchReader(repoDir)
 	if err != nil {
-		die("resolve path: %v", err)
+		return nil, fmt.Errorf("start cat-file --batch: %w", err)
 	}
-	if err := exec.Command("git", "-C", abs, "rev-parse", "--git-dir").Run(); err != nil {
-		die("%s is not a git repository", abs)
-	}
-
-	batch, err := newBatchReader(abs)
-	if err != nil {
-		die("start cat-file --batch: %v", err)
-	}
-	defer batch.Close()
 
 	s := &server{
-		repoDir:   abs,
-		ref:       *ref,
+		repoDir:   repoDir,
+		ref:       ref,
+		bare:      bare,
 		blobCache: make(map[string][]byte),
 		treeCache: make(map[string]string),
 		batch:     batch,
 	}
 
-	if *indexFlag {
-		idx, err := buildTrigramIndex(batch, abs, *ref)
+	if buildIndex {
+		idx, err := buildTrigramIndex(batch, repoDir, ref)
 		if err != nil {
-			die("build index: %v", err)
+			batch.Close()
+			return nil, fmt.Errorf("build index: %w", err)
 		}
 		s.index = idx
 	}
 
-	fmt.Fprintf(os.Stderr, "glimpse MCP server (zero deps, git CLI)\n")
-	fmt.Fprintf(os.Stderr, "  repo:  %s\n", abs)
-	fmt.Fprintf(os.Stderr, "  ref:   %s\n", *ref)
-	if s.index != nil {
-		fmt.Fprintf(os.Stderr, "  index: %d files\n", len(s.index.paths))
-	}
-
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 0, 10<<20), 10<<20)
-
-	enc := json.NewEncoder(os.Stdout)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		var req request
-		if err := json.Unmarshal(line, &req); err != nil {
-			continue
-		}
-
-		if len(req.ID) == 0 || string(req.ID) == "null" {
-			continue
-		}
-
-		resp := response{JSONRPC: "2.0", ID: req.ID}
-
-		switch req.Method {
-		case "initialize":
-			resp.Result = initResult{
-				ProtocolVersion: "2024-11-05",
-				Capabilities:    map[string]any{"tools": map[string]any{}},
-				ServerInfo:      map[string]any{"name": "glimpse", "version": "1.0.0"},
-			}
-		case "tools/list":
-			resp.Result = map[string]any{"tools": s.toolDefs()}
-		case "tools/call":
-			resp.Result = s.dispatchTool(req.Params)
-		default:
-			resp.Error = map[string]any{"code": -32601, "message": "method not found: " + req.Method}
-		}
-
-		_ = enc.Encode(resp)
-	}
+	return s, nil
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions
+// Mux — multiplexes across repos, handles open_repo
 // ---------------------------------------------------------------------------
 
-func (s *server) toolDefs() []toolDef {
+type mux struct {
+	cacheDir   string
+	indexFlag  bool
+
+	mu      sync.Mutex
+	current *server
+}
+
+func (m *mux) toolDefs() []toolDef {
 	str := func(desc string) map[string]any {
 		return map[string]any{"type": "string", "description": desc}
 	}
 
 	return []toolDef{
+		{
+			Name:        "open_repo",
+			Description: "Open a git repo for exploration. Accepts a clone URL (bare-cloned and cached locally) or a local path. Builds a trigram index automatically for sub-10ms grep.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url": str("Git clone URL (https or ssh) or absolute local path"),
+					"ref": str("Branch, tag, or commit to serve (default: HEAD)"),
+				},
+				"required": []string{"url"},
+			},
+		},
 		{
 			Name:        "list_directory",
 			Description: "List files and directories at a path in the git repository",
@@ -301,7 +260,7 @@ func (s *server) toolDefs() []toolDef {
 		},
 		{
 			Name:        "write_file",
-			Description: "Write content to a file in the worktree (creates parent directories as needed)",
+			Description: "Write content to a file in the worktree (only available for local repos, not bare clones)",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -335,14 +294,35 @@ func (s *server) toolDefs() []toolDef {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Tool dispatch
-// ---------------------------------------------------------------------------
-
-func (s *server) dispatchTool(raw json.RawMessage) toolResult {
+func (m *mux) dispatchTool(raw json.RawMessage) toolResult {
 	var p callToolParams
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return errResult("invalid params: " + err.Error())
+	}
+
+	if p.Name == "open_repo" {
+		var args struct {
+			URL string `json:"url"`
+			Ref string `json:"ref"`
+		}
+		if len(p.Arguments) > 0 {
+			_ = json.Unmarshal(p.Arguments, &args)
+		}
+		if args.URL == "" {
+			return errResult("url is required")
+		}
+		if args.Ref == "" {
+			args.Ref = "HEAD"
+		}
+		return m.openRepo(args.URL, args.Ref)
+	}
+
+	m.mu.Lock()
+	s := m.current
+	m.mu.Unlock()
+
+	if s == nil {
+		return errResult("no repo open — call open_repo first, or start with --repo")
 	}
 
 	var args struct {
@@ -370,11 +350,219 @@ func (s *server) dispatchTool(raw json.RawMessage) toolResult {
 	}
 }
 
+func (m *mux) openRepo(urlOrPath, ref string) toolResult {
+	start := time.Now()
+
+	repoDir, bare, err := m.resolveRepo(urlOrPath)
+	if err != nil {
+		return errResult(err.Error())
+	}
+
+	s, err := openServer(repoDir, ref, bare, true)
+	if err != nil {
+		return errResult(fmt.Sprintf("open %s: %v", urlOrPath, err))
+	}
+
+	m.mu.Lock()
+	old := m.current
+	m.current = s
+	m.mu.Unlock()
+
+	if old != nil {
+		old.Close()
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "repo:  %s\n", repoDir)
+	fmt.Fprintf(&sb, "ref:   %s\n", ref)
+	if bare {
+		fmt.Fprintf(&sb, "mode:  bare clone (read-only)\n")
+	} else {
+		fmt.Fprintf(&sb, "mode:  local worktree\n")
+	}
+	if s.index != nil {
+		fmt.Fprintf(&sb, "index: %d files\n", len(s.index.paths))
+	}
+	fmt.Fprintf(&sb, "ready in %s\n", time.Since(start).Round(time.Millisecond))
+
+	fmt.Fprintf(os.Stderr, "  opened: %s (%d files indexed, %s)\n",
+		urlOrPath, len(s.index.paths), time.Since(start).Round(time.Millisecond))
+
+	return textResult(sb.String())
+}
+
+// resolveRepo resolves a URL or local path to a git directory.
+// Returns (repoDir, isBare, error).
+func (m *mux) resolveRepo(urlOrPath string) (string, bool, error) {
+	if isGitURL(urlOrPath) {
+		dir, err := m.cloneOrFetch(urlOrPath)
+		if err != nil {
+			return "", false, err
+		}
+		return dir, true, nil
+	}
+
+	abs, err := filepath.Abs(urlOrPath)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve path: %w", err)
+	}
+	if err := exec.Command("git", "-C", abs, "rev-parse", "--git-dir").Run(); err != nil {
+		return "", false, fmt.Errorf("%s is not a git repository", abs)
+	}
+	return abs, false, nil
+}
+
+func (m *mux) cloneOrFetch(url string) (string, error) {
+	dir := m.repoCacheDir(url)
+
+	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err == nil {
+		fmt.Fprintf(os.Stderr, "  cached: %s → fetch\n", dir)
+		cmd := exec.Command("git", "-C", dir, "fetch", "--quiet", "origin")
+		cmd.Stderr = os.Stderr
+		_ = cmd.Run()
+		return dir, nil
+	}
+
+	fmt.Fprintf(os.Stderr, "  cloning: %s\n", url)
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return "", err
+	}
+	cmd := exec.Command("git", "clone", "--bare", "--quiet", url, dir)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git clone --bare: %w", err)
+	}
+	return dir, nil
+}
+
+func (m *mux) repoCacheDir(url string) string {
+	name := url
+	name = strings.TrimSuffix(name, ".git")
+	r := strings.NewReplacer("://", "-", "/", "-", ":", "-", "@", "-")
+	name = r.Replace(name)
+	return filepath.Join(m.cacheDir, name)
+}
+
+func isGitURL(s string) bool {
+	return strings.Contains(s, "://") || strings.HasPrefix(s, "git@")
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+func main() {
+	repo := flag.String("repo", "", "Path to git repository (optional — agents can call open_repo instead)")
+	ref := flag.String("ref", "HEAD", "Git ref to serve (branch, tag, commit)")
+	indexFlag := flag.Bool("index", false, "Build trigram index on startup (always on for open_repo)")
+	cacheDir := flag.String("cache-dir", "", "Where to store bare clones (default: ~/.cache/glimpse)")
+	flag.Parse()
+
+	if *cacheDir == "" {
+		home, _ := os.UserHomeDir()
+		*cacheDir = filepath.Join(home, ".cache", "glimpse")
+	}
+
+	m := &mux{
+		cacheDir:  *cacheDir,
+		indexFlag: *indexFlag,
+	}
+
+	// If --repo given, pre-open it (backward compat)
+	if *repo != "" {
+		abs, err := resolveRepoPath(*repo)
+		if err != nil {
+			die("%v", err)
+		}
+		s, err := openServer(abs, *ref, false, *indexFlag)
+		if err != nil {
+			die("%v", err)
+		}
+		defer s.Close()
+		m.current = s
+	}
+
+	fmt.Fprintf(os.Stderr, "glimpse MCP server\n")
+	fmt.Fprintf(os.Stderr, "  cache: %s\n", *cacheDir)
+	if m.current != nil {
+		fmt.Fprintf(os.Stderr, "  repo:  %s\n", m.current.repoDir)
+		fmt.Fprintf(os.Stderr, "  ref:   %s\n", m.current.ref)
+		if m.current.index != nil {
+			fmt.Fprintf(os.Stderr, "  index: %d files\n", len(m.current.index.paths))
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "  (no repo — agents should call open_repo)\n")
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 10<<20), 10<<20)
+	enc := json.NewEncoder(os.Stdout)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var req request
+		if err := json.Unmarshal(line, &req); err != nil {
+			continue
+		}
+
+		if len(req.ID) == 0 || string(req.ID) == "null" {
+			continue
+		}
+
+		resp := response{JSONRPC: "2.0", ID: req.ID}
+
+		switch req.Method {
+		case "initialize":
+			resp.Result = initResult{
+				ProtocolVersion: "2024-11-05",
+				Capabilities:    map[string]any{"tools": map[string]any{}},
+				ServerInfo:      map[string]any{"name": "glimpse", "version": "2.0.0"},
+			}
+		case "tools/list":
+			resp.Result = map[string]any{"tools": m.toolDefs()}
+		case "tools/call":
+			resp.Result = m.dispatchTool(req.Params)
+		default:
+			resp.Error = map[string]any{"code": -32601, "message": "method not found: " + req.Method}
+		}
+
+		_ = enc.Encode(resp)
+	}
+}
+
+func resolveRepoPath(repo string) (string, error) {
+	if repo == "" {
+		dir, _ := os.Getwd()
+		for {
+			if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+				return dir, nil
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				return "", fmt.Errorf("not inside a git repo and --repo not specified")
+			}
+			dir = parent
+		}
+	}
+
+	abs, err := filepath.Abs(repo)
+	if err != nil {
+		return "", fmt.Errorf("resolve path: %w", err)
+	}
+	if err := exec.Command("git", "-C", abs, "rev-parse", "--git-dir").Run(); err != nil {
+		return "", fmt.Errorf("%s is not a git repository", abs)
+	}
+	return abs, nil
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
 
-// listDirectory runs `git ls-tree -l` with results cached for the session.
 func (s *server) listDirectory(path string) toolResult {
 	path = normPath(path)
 	cacheKey := "ls:" + path
@@ -422,7 +610,6 @@ func (s *server) listDirectory(path string) toolResult {
 	return textResult(sb.String())
 }
 
-// readFile uses the persistent cat-file --batch process, with blob caching.
 func (s *server) readFile(path string) toolResult {
 	if path == "" {
 		return errResult("path is required")
@@ -447,8 +634,10 @@ func (s *server) readFile(path string) toolResult {
 	return textResult(string(data))
 }
 
-// writeFile writes content to the worktree and invalidates the cache.
 func (s *server) writeFile(path, content string) toolResult {
+	if s.bare {
+		return errResult("write_file is not available for bare-cloned repos (read-only) — clone locally to write")
+	}
 	if path == "" {
 		return errResult("path is required")
 	}
@@ -473,7 +662,6 @@ func (s *server) writeFile(path, content string) toolResult {
 	return textResult(fmt.Sprintf("wrote %d bytes to %s", len(content), path))
 }
 
-// fileInfo uses cached ls-tree results to get metadata.
 func (s *server) fileInfo(path string) toolResult {
 	if path == "" {
 		return errResult("path is required")
@@ -513,7 +701,6 @@ func (s *server) fileInfo(path string) toolResult {
 	return textResult(fmt.Sprintf("type: file\npath: %s\nsize: %s bytes\nmode: %s", path, meta[3], mode))
 }
 
-// grep uses the trigram index when available, falls back to git grep.
 func (s *server) grep(pattern, path string) toolResult {
 	if pattern == "" {
 		return errResult("pattern is required")
@@ -556,7 +743,7 @@ type trigramIndex struct {
 
 func buildTrigramIndex(batch *batchReader, repoDir, ref string) (*trigramIndex, error) {
 	start := time.Now()
-	fmt.Fprintf(os.Stderr, "building trigram index...\n")
+	fmt.Fprintf(os.Stderr, "  building trigram index...\n")
 
 	out, err := gitCmd("-C", repoDir, "ls-tree", "-r", "--name-only", ref)
 	if err != nil {
@@ -578,7 +765,6 @@ func buildTrigramIndex(batch *batchReader, repoDir, ref string) (*trigramIndex, 
 			continue
 		}
 
-		// skip binary files
 		peek := data
 		if len(peek) > 8192 {
 			peek = peek[:8192]
@@ -601,11 +787,11 @@ func buildTrigramIndex(batch *batchReader, repoDir, ref string) (*trigramIndex, 
 		}
 
 		if (i+1)%2000 == 0 {
-			fmt.Fprintf(os.Stderr, "  indexed %d/%d files\n", i+1, len(allPaths))
+			fmt.Fprintf(os.Stderr, "    indexed %d/%d files\n", i+1, len(allPaths))
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "  done: %d text files indexed in %s\n", len(idx.paths), time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "    %d text files, %s\n", len(idx.paths), time.Since(start).Round(time.Millisecond))
 	return idx, nil
 }
 
@@ -652,7 +838,6 @@ func (idx *trigramIndex) intersect(trigrams [][3]byte) []int32 {
 		return nil
 	}
 
-	// start with the shortest posting list
 	shortest := 0
 	for i := range trigrams {
 		if len(idx.posting[trigrams[i]]) < len(idx.posting[trigrams[shortest]]) {
@@ -688,9 +873,6 @@ func (idx *trigramIndex) intersect(trigrams [][3]byte) []int32 {
 	return result
 }
 
-// extractTrigrams pulls literal 3-byte sequences from a search pattern,
-// skipping regex metacharacters. Used to narrow candidate files before
-// doing the actual regexp match.
 func extractTrigrams(pattern string) [][3]byte {
 	const meta = `.+*?[](){}|^$`
 
@@ -734,7 +916,6 @@ func extractTrigrams(pattern string) [][3]byte {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// cachedTree returns a cached ls-tree result or calls fn and caches it.
 func (s *server) cachedTree(key string, fn func() (string, error)) (string, error) {
 	s.mu.Lock()
 	if cached, ok := s.treeCache[key]; ok {

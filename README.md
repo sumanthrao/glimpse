@@ -170,16 +170,34 @@ The MCP server lets AI agents glimpse into repos directly from the git object st
 go build -o glimpse-mcp ./cmd/glimpse-mcp
 ```
 
-### Claude Code
+### Two Modes
 
-Add to your Claude Code config:
+**Single repo** — lock to one repo at startup (backward compatible):
+
+```bash
+glimpse-mcp --repo /path/to/repo --index
+```
+
+**Multi repo** — one server, any repo on demand. Agents call `open_repo` with a URL or path. Repos are bare-cloned into `~/.cache/glimpse/` and reused across sessions:
+
+```bash
+glimpse-mcp
+```
+
+Then the agent calls:
+```
+open_repo(url: "https://github.com/org/repo.git")
+```
+
+The server bare-clones, builds a trigram index, and is ready in seconds. Subsequent opens of the same URL skip the clone entirely.
+
+### Claude Code
 
 ```json
 {
   "mcpServers": {
     "glimpse": {
-      "command": "/path/to/glimpse-mcp",
-      "args": ["--repo", "/path/to/your/repo", "--index"]
+      "command": "/path/to/glimpse-mcp"
     }
   }
 }
@@ -193,8 +211,7 @@ Add to `.cursor/mcp.json`:
 {
   "mcpServers": {
     "glimpse": {
-      "command": "/path/to/glimpse-mcp",
-      "args": ["--repo", "/path/to/your/repo", "--ref", "main", "--index"]
+      "command": "/path/to/glimpse-mcp"
     }
   }
 }
@@ -204,19 +221,21 @@ Add to `.cursor/mcp.json`:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--repo` | *(auto-detected from cwd)* | Path to the git repository |
+| `--repo` | *(optional)* | Lock to one repo at startup |
 | `--ref` | `HEAD` | Git ref to serve |
-| `--index` | `false` | Build a trigram index on startup for sub-10ms grep |
+| `--index` | `false` | Build trigram index on startup (always on for `open_repo`) |
+| `--cache-dir` | `~/.cache/glimpse` | Where to store bare clones |
 
 ### Tools
 
-| Tool | Backed by | Description |
-|------|-----------|-------------|
-| `list_directory(path?)` | `git ls-tree` (cached) | List entries with sizes |
-| `read_file(path)` | `cat-file --batch` (cached) | Read file, cached in memory |
-| `write_file(path, content)` | `os.WriteFile` | Write file to worktree |
-| `file_info(path)` | `git ls-tree -l` (cached) | Size, type, mode |
-| `grep(pattern, path?)` | trigram index / `git grep` | Search contents — sub-10ms with `--index` |
+| Tool | Description |
+|------|-------------|
+| `open_repo(url, ref?)` | Open a repo by URL (bare-cloned, cached) or local path. Builds trigram index automatically. |
+| `list_directory(path?)` | List entries with sizes (cached) |
+| `read_file(path)` | Read file from object store (cached in memory) |
+| `write_file(path, content)` | Write to worktree (local repos only, not bare clones) |
+| `file_info(path)` | Size, type, mode (cached) |
+| `grep(pattern, path?)` | Search contents — sub-10ms with trigram index |
 
 ### Try It
 
