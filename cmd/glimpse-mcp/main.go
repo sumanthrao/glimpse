@@ -164,13 +164,15 @@ func (b *batchReader) Close() {
 // ---------------------------------------------------------------------------
 
 type server struct {
-	repoDir string
-	ref     string
-	bare    bool // true if opened via bare clone (no worktree)
+	repoDir     string
+	ref         string
+	bare        bool   // true if opened via bare clone
+	worktreeDir string // sparse worktree created on first write (bare repos only)
 
-	mu        sync.Mutex
-	blobCache map[string][]byte
-	treeCache map[string]string
+	mu           sync.Mutex
+	blobCache    map[string][]byte
+	treeCache    map[string]string
+	writtenFiles map[string]bool // files the agent has written (for scoping git tools)
 
 	batch *batchReader
 	index *trigramIndex
@@ -182,6 +184,42 @@ func (s *server) Close() {
 	}
 }
 
+// ensureWorktree lazily creates a sparse worktree from a bare clone.
+// The worktree starts empty (--no-checkout) so it's instant. Files
+// appear only when the agent writes them.
+func (s *server) ensureWorktree() error {
+	if s.worktreeDir != "" {
+		return nil
+	}
+
+	dir := s.repoDir + "-work"
+
+	// reuse existing worktree from a previous session
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		s.worktreeDir = dir
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "  creating worktree: %s\n", dir)
+	cmd := exec.Command("git", "-C", s.repoDir, "worktree", "add",
+		"--detach", "--no-checkout", dir, s.ref)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git worktree add: %w", err)
+	}
+
+	s.worktreeDir = dir
+	return nil
+}
+
+// writeDir returns the directory to write files into.
+func (s *server) writeDir() string {
+	if s.worktreeDir != "" {
+		return s.worktreeDir
+	}
+	return s.repoDir
+}
+
 // openServer creates a server for the given repo directory.
 // If buildIndex is true, a trigram index is built on open.
 func openServer(repoDir, ref string, bare, buildIndex bool) (*server, error) {
@@ -191,12 +229,13 @@ func openServer(repoDir, ref string, bare, buildIndex bool) (*server, error) {
 	}
 
 	s := &server{
-		repoDir:   repoDir,
-		ref:       ref,
-		bare:      bare,
-		blobCache: make(map[string][]byte),
-		treeCache: make(map[string]string),
-		batch:     batch,
+		repoDir:      repoDir,
+		ref:          ref,
+		bare:         bare,
+		blobCache:    make(map[string][]byte),
+		treeCache:    make(map[string]string),
+		writtenFiles: make(map[string]bool),
+		batch:        batch,
 	}
 
 	if buildIndex {
@@ -260,7 +299,7 @@ func (m *mux) toolDefs() []toolDef {
 		},
 		{
 			Name:        "write_file",
-			Description: "Write content to a file in the worktree (only available for local repos, not bare clones)",
+			Description: "Write content to a file in the worktree. For bare-cloned repos, a sparse worktree is created on first write.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -289,6 +328,31 @@ func (m *mux) toolDefs() []toolDef {
 					"path":    str("Limit search to this directory/file (optional)"),
 				},
 				"required": []string{"pattern"},
+			},
+		},
+		{
+			Name:        "git_diff",
+			Description: "Show uncommitted changes in the worktree (like git diff). Shows a unified diff of all modified files, or a specific file.",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"path": str("Limit diff to this file (optional)")},
+			},
+		},
+		{
+			Name:        "git_status",
+			Description: "Show worktree status — which files have been added, modified, or deleted",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "git_commit",
+			Description: "Stage all changes and commit them in the worktree",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"message": str("Commit message")},
+				"required":   []string{"message"},
 			},
 		},
 	}
@@ -329,6 +393,7 @@ func (m *mux) dispatchTool(raw json.RawMessage) toolResult {
 		Path    string `json:"path"`
 		Pattern string `json:"pattern"`
 		Content string `json:"content"`
+		Message string `json:"message"`
 	}
 	if len(p.Arguments) > 0 {
 		_ = json.Unmarshal(p.Arguments, &args)
@@ -345,6 +410,12 @@ func (m *mux) dispatchTool(raw json.RawMessage) toolResult {
 		return s.fileInfo(args.Path)
 	case "grep":
 		return s.grep(args.Pattern, args.Path)
+	case "git_diff":
+		return s.gitDiff(args.Path)
+	case "git_status":
+		return s.gitStatus()
+	case "git_commit":
+		return s.gitCommit(args.Message)
 	default:
 		return errResult("unknown tool: " + p.Name)
 	}
@@ -376,7 +447,7 @@ func (m *mux) openRepo(urlOrPath, ref string) toolResult {
 	fmt.Fprintf(&sb, "repo:  %s\n", repoDir)
 	fmt.Fprintf(&sb, "ref:   %s\n", ref)
 	if bare {
-		fmt.Fprintf(&sb, "mode:  bare clone (read-only)\n")
+		fmt.Fprintf(&sb, "mode:  bare clone (worktree created on first write)\n")
 	} else {
 		fmt.Fprintf(&sb, "mode:  local worktree\n")
 	}
@@ -635,9 +706,6 @@ func (s *server) readFile(path string) toolResult {
 }
 
 func (s *server) writeFile(path, content string) toolResult {
-	if s.bare {
-		return errResult("write_file is not available for bare-cloned repos (read-only) — clone locally to write")
-	}
 	if path == "" {
 		return errResult("path is required")
 	}
@@ -645,7 +713,13 @@ func (s *server) writeFile(path, content string) toolResult {
 		return errResult("path must not contain '..'")
 	}
 
-	fullPath := filepath.Join(s.repoDir, path)
+	if s.bare {
+		if err := s.ensureWorktree(); err != nil {
+			return errResult(fmt.Sprintf("create worktree: %v", err))
+		}
+	}
+
+	fullPath := filepath.Join(s.writeDir(), path)
 
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
 		return errResult(fmt.Sprintf("create directory: %v", err))
@@ -657,6 +731,7 @@ func (s *server) writeFile(path, content string) toolResult {
 
 	s.mu.Lock()
 	delete(s.blobCache, path)
+	s.writtenFiles[path] = true
 	s.mu.Unlock()
 
 	return textResult(fmt.Sprintf("wrote %d bytes to %s", len(content), path))
@@ -729,6 +804,117 @@ func (s *server) grep(pattern, path string) toolResult {
 	}
 
 	return textResult(sb.String())
+}
+
+func (s *server) gitDiff(path string) toolResult {
+	dir := s.writeDir()
+	args := []string{"-C", dir, "diff", "HEAD", "--"}
+
+	if path != "" {
+		args = append(args, path)
+	} else {
+		s.mu.Lock()
+		for p := range s.writtenFiles {
+			args = append(args, p)
+		}
+		s.mu.Unlock()
+	}
+
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return errResult("git diff: " + err.Error())
+	}
+
+	// For new files not in HEAD, git diff won't show them.
+	// Append a summary of untracked new files.
+	result := strings.TrimSpace(string(out))
+	s.mu.Lock()
+	for p := range s.writtenFiles {
+		if path != "" && p != path {
+			continue
+		}
+		spec := s.ref + ":" + p
+		if _, err := s.batch.Read(spec); err != nil {
+			data, _ := os.ReadFile(filepath.Join(dir, p))
+			if data != nil {
+				result += fmt.Sprintf("\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1,%d @@\n", p, len(strings.Split(string(data), "\n")))
+				for _, line := range strings.Split(string(data), "\n") {
+					result += "+" + line + "\n"
+				}
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	if result == "" {
+		return textResult("no changes")
+	}
+	return textResult(result)
+}
+
+func (s *server) gitStatus() toolResult {
+	dir := s.writeDir()
+
+	s.mu.Lock()
+	files := make([]string, 0, len(s.writtenFiles))
+	for p := range s.writtenFiles {
+		files = append(files, p)
+	}
+	s.mu.Unlock()
+
+	if len(files) == 0 {
+		return textResult("clean — no changes")
+	}
+
+	args := []string{"-C", dir, "status", "--short", "--"}
+	args = append(args, files...)
+
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return errResult("git status: " + err.Error())
+	}
+	if len(strings.TrimSpace(string(out))) == 0 {
+		return textResult("clean — no changes")
+	}
+	return textResult(string(out))
+}
+
+func (s *server) gitCommit(message string) toolResult {
+	if message == "" {
+		return errResult("message is required")
+	}
+
+	dir := s.writeDir()
+
+	s.mu.Lock()
+	files := make([]string, 0, len(s.writtenFiles))
+	for p := range s.writtenFiles {
+		files = append(files, p)
+	}
+	s.mu.Unlock()
+
+	if len(files) == 0 {
+		return errResult("no files written — nothing to commit")
+	}
+
+	// Populate the index with the full tree from HEAD so the commit
+	// preserves all original files (--no-checkout leaves the index bare).
+	if out, err := exec.Command("git", "-C", dir, "read-tree", "HEAD").CombinedOutput(); err != nil {
+		return errResult(fmt.Sprintf("read-tree: %s", string(out)))
+	}
+
+	// Stage the agent's files on top
+	for _, f := range files {
+		if out, err := exec.Command("git", "-C", dir, "add", f).CombinedOutput(); err != nil {
+			return errResult(fmt.Sprintf("git add %s: %s", f, string(out)))
+		}
+	}
+
+	out, err := exec.Command("git", "-C", dir, "commit", "-m", message).CombinedOutput()
+	if err != nil {
+		return errResult(fmt.Sprintf("git commit: %s", string(out)))
+	}
+	return textResult(string(out))
 }
 
 // ---------------------------------------------------------------------------

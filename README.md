@@ -233,9 +233,12 @@ Add to `.cursor/mcp.json`:
 | `open_repo(url, ref?)` | Open a repo by URL (bare-cloned, cached) or local path. Builds trigram index automatically. |
 | `list_directory(path?)` | List entries with sizes (cached) |
 | `read_file(path)` | Read file from object store (cached in memory) |
-| `write_file(path, content)` | Write to worktree (local repos only, not bare clones) |
+| `write_file(path, content)` | Write file — creates a sparse worktree on first write for bare clones |
 | `file_info(path)` | Size, type, mode (cached) |
 | `grep(pattern, path?)` | Search contents — sub-10ms with trigram index |
+| `git_status()` | Show which files the agent has changed |
+| `git_diff(path?)` | Unified diff of agent's changes against HEAD |
+| `git_commit(message)` | Stage and commit only the agent's changes |
 
 ### Try It
 
