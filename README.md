@@ -294,10 +294,6 @@ The FUSE filesystem uses [go-git](https://github.com/go-git/go-git), which doesn
 
 **Status:** Upstream go-git limitation. The long-term fix is to either patch go-git or migrate the FUSE backend to use the git CLI (like the MCP server already does).
 
-### Per-operation latency
-
-Individual operations through glimpse are 2-6x slower than raw `git show` / `git ls-tree` due to the overhead of FUSE interception (FUSE mode) or MCP JSON-RPC framing (MCP mode). The value is in **avoiding checkout**, not in per-file speed — you trade per-operation latency for O(1) startup and minimal disk usage.
-
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
