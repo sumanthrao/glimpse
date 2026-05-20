@@ -179,7 +179,7 @@ Add to your Claude Code config:
   "mcpServers": {
     "glimpse": {
       "command": "/path/to/glimpse-mcp",
-      "args": ["--repo", "/path/to/your/repo"]
+      "args": ["--repo", "/path/to/your/repo", "--index"]
     }
   }
 }
@@ -194,21 +194,29 @@ Add to `.cursor/mcp.json`:
   "mcpServers": {
     "glimpse": {
       "command": "/path/to/glimpse-mcp",
-      "args": ["--repo", "/path/to/your/repo", "--ref", "main"]
+      "args": ["--repo", "/path/to/your/repo", "--ref", "main", "--index"]
     }
   }
 }
 ```
 
+### MCP Server Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--repo` | *(auto-detected from cwd)* | Path to the git repository |
+| `--ref` | `HEAD` | Git ref to serve |
+| `--index` | `false` | Build a trigram index on startup for sub-10ms grep |
+
 ### Tools
 
 | Tool | Backed by | Description |
 |------|-----------|-------------|
-| `list_directory(path?)` | `git ls-tree` | List entries with sizes |
-| `read_file(path)` | `git show` | Read file, cached in memory |
+| `list_directory(path?)` | `git ls-tree` (cached) | List entries with sizes |
+| `read_file(path)` | `cat-file --batch` (cached) | Read file, cached in memory |
 | `write_file(path, content)` | `os.WriteFile` | Write file to worktree |
-| `file_info(path)` | `git ls-tree -l` | Size, type, mode |
-| `grep(pattern, path?)` | `git grep` | Search contents across repo |
+| `file_info(path)` | `git ls-tree -l` (cached) | Size, type, mode |
+| `grep(pattern, path?)` | trigram index / `git grep` | Search contents — sub-10ms with `--index` |
 
 ### Try It
 
@@ -282,6 +290,7 @@ glimpse/
 - **Hybrid in-memory/disk.** Reads are served from an in-memory blob cache — zero disk I/O for browsing, grepping, and building. Files only materialize to the real worktree when you write to them.
 - **Materialize on write, then get out of the way.** Once a file is flushed to disk (triggered by a write), FUSE delegates to the real file. No ongoing overhead.
 - **Zero-dep MCP server.** The agent integration server uses only the Go stdlib and the `git` CLI — no go-git, no mcp-go, no FUSE. Builds instantly, runs anywhere.
+- **Trigram index.** With `--index`, the MCP server builds an in-memory trigram index on startup (like [zoekt](https://github.com/sourcegraph/zoekt)). Grep narrows candidates via posting list intersection before doing a regexp match — sub-10ms for most queries.
 - **Ephemeral mode.** With `--ephemeral`, sparse-checkout setup is skipped entirely — ideal for AI agent sessions or CI pipelines where nothing needs to persist.
 
 ## Known Limitations

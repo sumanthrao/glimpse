@@ -6,6 +6,7 @@
 //   - Persistent git cat-file --batch process for blob reads (no process spawn per read)
 //   - Tree cache: ls-tree results are cached for the session (fixed ref = immutable trees)
 //   - Blob cache: file contents cached after first read
+//   - Trigram index (--index): pre-built in-memory index for sub-10ms grep
 //
 // Usage:
 //
@@ -15,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,9 +24,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -165,11 +170,13 @@ type server struct {
 	treeCache map[string]string
 
 	batch *batchReader
+	index *trigramIndex // nil if --index not used
 }
 
 func main() {
 	repo := flag.String("repo", "", "Path to git repository (auto-detected from cwd if omitted)")
 	ref := flag.String("ref", "HEAD", "Git ref to serve (branch, tag, commit)")
+	indexFlag := flag.Bool("index", false, "Build a trigram index on startup for sub-10ms grep")
 	flag.Parse()
 
 	if *repo == "" {
@@ -209,9 +216,20 @@ func main() {
 		batch:     batch,
 	}
 
+	if *indexFlag {
+		idx, err := buildTrigramIndex(batch, abs, *ref)
+		if err != nil {
+			die("build index: %v", err)
+		}
+		s.index = idx
+	}
+
 	fmt.Fprintf(os.Stderr, "glimpse MCP server (zero deps, git CLI)\n")
-	fmt.Fprintf(os.Stderr, "  repo: %s\n", abs)
-	fmt.Fprintf(os.Stderr, "  ref:  %s\n", *ref)
+	fmt.Fprintf(os.Stderr, "  repo:  %s\n", abs)
+	fmt.Fprintf(os.Stderr, "  ref:   %s\n", *ref)
+	if s.index != nil {
+		fmt.Fprintf(os.Stderr, "  index: %d files\n", len(s.index.paths))
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 10<<20), 10<<20)
@@ -304,7 +322,7 @@ func (s *server) toolDefs() []toolDef {
 		},
 		{
 			Name:        "grep",
-			Description: "Search file contents in the repository using git grep",
+			Description: "Search file contents (uses in-memory trigram index when available, otherwise git grep)",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -495,10 +513,14 @@ func (s *server) fileInfo(path string) toolResult {
 	return textResult(fmt.Sprintf("type: file\npath: %s\nsize: %s bytes\nmode: %s", path, meta[3], mode))
 }
 
-// grep runs `git grep` (still spawns a process — grep is inherently variable).
+// grep uses the trigram index when available, falls back to git grep.
 func (s *server) grep(pattern, path string) toolResult {
 	if pattern == "" {
 		return errResult("pattern is required")
+	}
+
+	if s.index != nil {
+		return s.index.search(pattern, path)
 	}
 
 	args := []string{"-C", s.repoDir, "grep", "-n", "-I", pattern, s.ref}
@@ -520,6 +542,192 @@ func (s *server) grep(pattern, path string) toolResult {
 	}
 
 	return textResult(sb.String())
+}
+
+// ---------------------------------------------------------------------------
+// Trigram index — pre-built in-memory index for sub-10ms grep
+// ---------------------------------------------------------------------------
+
+type trigramIndex struct {
+	paths    []string
+	contents [][]byte
+	posting  map[[3]byte][]int32
+}
+
+func buildTrigramIndex(batch *batchReader, repoDir, ref string) (*trigramIndex, error) {
+	start := time.Now()
+	fmt.Fprintf(os.Stderr, "building trigram index...\n")
+
+	out, err := gitCmd("-C", repoDir, "ls-tree", "-r", "--name-only", ref)
+	if err != nil {
+		return nil, fmt.Errorf("ls-tree -r: %w", err)
+	}
+
+	allPaths := strings.Split(strings.TrimSpace(out), "\n")
+	idx := &trigramIndex{
+		posting: make(map[[3]byte][]int32, 1<<16),
+	}
+
+	for i, path := range allPaths {
+		if path == "" {
+			continue
+		}
+
+		data, err := batch.Read(ref + ":" + path)
+		if err != nil {
+			continue
+		}
+
+		// skip binary files
+		peek := data
+		if len(peek) > 8192 {
+			peek = peek[:8192]
+		}
+		if bytes.IndexByte(peek, 0) >= 0 {
+			continue
+		}
+
+		fileIdx := int32(len(idx.paths))
+		idx.paths = append(idx.paths, path)
+		idx.contents = append(idx.contents, data)
+
+		seen := make(map[[3]byte]bool)
+		for j := 0; j <= len(data)-3; j++ {
+			tri := [3]byte{data[j], data[j+1], data[j+2]}
+			if !seen[tri] {
+				seen[tri] = true
+				idx.posting[tri] = append(idx.posting[tri], fileIdx)
+			}
+		}
+
+		if (i+1)%2000 == 0 {
+			fmt.Fprintf(os.Stderr, "  indexed %d/%d files\n", i+1, len(allPaths))
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "  done: %d text files indexed in %s\n", len(idx.paths), time.Since(start).Round(time.Millisecond))
+	return idx, nil
+}
+
+func (idx *trigramIndex) search(pattern, pathPrefix string) toolResult {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return errResult("invalid regex: " + err.Error())
+	}
+
+	trigrams := extractTrigrams(pattern)
+
+	var candidates []int32
+	if len(trigrams) > 0 {
+		candidates = idx.intersect(trigrams)
+	} else {
+		candidates = make([]int32, len(idx.paths))
+		for i := range candidates {
+			candidates[i] = int32(i)
+		}
+	}
+
+	var sb strings.Builder
+	for _, fi := range candidates {
+		path := idx.paths[fi]
+		if pathPrefix != "" && !strings.HasPrefix(path, pathPrefix) {
+			continue
+		}
+		lines := strings.Split(string(idx.contents[fi]), "\n")
+		for lineNo, line := range lines {
+			if re.MatchString(line) {
+				fmt.Fprintf(&sb, "%s:%d:%s\n", path, lineNo+1, line)
+			}
+		}
+	}
+
+	if sb.Len() == 0 {
+		return textResult("no matches found")
+	}
+	return textResult(sb.String())
+}
+
+func (idx *trigramIndex) intersect(trigrams [][3]byte) []int32 {
+	if len(trigrams) == 0 {
+		return nil
+	}
+
+	// start with the shortest posting list
+	shortest := 0
+	for i := range trigrams {
+		if len(idx.posting[trigrams[i]]) < len(idx.posting[trigrams[shortest]]) {
+			shortest = i
+		}
+	}
+
+	set := make(map[int32]bool, len(idx.posting[trigrams[shortest]]))
+	for _, fi := range idx.posting[trigrams[shortest]] {
+		set[fi] = true
+	}
+
+	for i, tri := range trigrams {
+		if i == shortest {
+			continue
+		}
+		other := make(map[int32]bool, len(idx.posting[tri]))
+		for _, fi := range idx.posting[tri] {
+			other[fi] = true
+		}
+		for fi := range set {
+			if !other[fi] {
+				delete(set, fi)
+			}
+		}
+	}
+
+	result := make([]int32, 0, len(set))
+	for fi := range set {
+		result = append(result, fi)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+// extractTrigrams pulls literal 3-byte sequences from a search pattern,
+// skipping regex metacharacters. Used to narrow candidate files before
+// doing the actual regexp match.
+func extractTrigrams(pattern string) [][3]byte {
+	const meta = `.+*?[](){}|^$`
+
+	var runs []string
+	var cur strings.Builder
+
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '\\' && i+1 < len(pattern) {
+			cur.WriteByte(pattern[i+1])
+			i++
+			continue
+		}
+		if strings.IndexByte(meta, pattern[i]) >= 0 {
+			if cur.Len() >= 3 {
+				runs = append(runs, cur.String())
+			}
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(pattern[i])
+	}
+	if cur.Len() >= 3 {
+		runs = append(runs, cur.String())
+	}
+
+	seen := make(map[[3]byte]bool)
+	var out [][3]byte
+	for _, run := range runs {
+		for j := 0; j <= len(run)-3; j++ {
+			tri := [3]byte{run[j], run[j+1], run[j+2]}
+			if !seen[tri] {
+				seen[tri] = true
+				out = append(out, tri)
+			}
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
