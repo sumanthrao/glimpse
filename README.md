@@ -206,6 +206,7 @@ Add to `.cursor/mcp.json`:
 |------|-----------|-------------|
 | `list_directory(path?)` | `git ls-tree` | List entries with sizes |
 | `read_file(path)` | `git show` | Read file, cached in memory |
+| `write_file(path, content)` | `os.WriteFile` | Write file to worktree |
 | `file_info(path)` | `git ls-tree -l` | Size, type, mode |
 | `grep(pattern, path?)` | `git grep` | Search contents across repo |
 
@@ -282,6 +283,20 @@ glimpse/
 - **Materialize on write, then get out of the way.** Once a file is flushed to disk (triggered by a write), FUSE delegates to the real file. No ongoing overhead.
 - **Zero-dep MCP server.** The agent integration server uses only the Go stdlib and the `git` CLI — no go-git, no mcp-go, no FUSE. Builds instantly, runs anywhere.
 - **Ephemeral mode.** With `--ephemeral`, sparse-checkout setup is skipped entirely — ideal for AI agent sessions or CI pipelines where nothing needs to persist.
+
+## Known Limitations
+
+### FUSE mode: `extensions.worktreeConfig`
+
+The FUSE filesystem uses [go-git](https://github.com/go-git/go-git), which doesn't support the `extensions.worktreeConfig` git extension. Many large monorepos (especially those using `git worktree`) enable this extension, causing glimpse FUSE mode to fail on open.
+
+**Workaround:** Use the MCP server instead — it shells out to the native `git` CLI and handles all extensions correctly.
+
+**Status:** Upstream go-git limitation. The long-term fix is to either patch go-git or migrate the FUSE backend to use the git CLI (like the MCP server already does).
+
+### Per-operation latency
+
+Individual operations through glimpse are 2-6x slower than raw `git show` / `git ls-tree` due to the overhead of FUSE interception (FUSE mode) or MCP JSON-RPC framing (MCP mode). The value is in **avoiding checkout**, not in per-file speed — you trade per-operation latency for O(1) startup and minimal disk usage.
 
 ## License
 

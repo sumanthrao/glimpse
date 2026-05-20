@@ -183,6 +183,18 @@ func (s *server) toolDefs() []toolDef {
 			},
 		},
 		{
+			Name:        "write_file",
+			Description: "Write content to a file in the worktree (creates parent directories as needed)",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":    str("File path relative to repo root"),
+					"content": str("File content to write"),
+				},
+				"required": []string{"path", "content"},
+			},
+		},
+		{
 			Name:        "file_info",
 			Description: "Get file metadata (size, type, mode) without reading the full content",
 			InputSchema: map[string]any{
@@ -219,6 +231,7 @@ func (s *server) dispatchTool(raw json.RawMessage) toolResult {
 	var args struct {
 		Path    string `json:"path"`
 		Pattern string `json:"pattern"`
+		Content string `json:"content"`
 	}
 	if len(p.Arguments) > 0 {
 		_ = json.Unmarshal(p.Arguments, &args)
@@ -229,6 +242,8 @@ func (s *server) dispatchTool(raw json.RawMessage) toolResult {
 		return s.listDirectory(args.Path)
 	case "read_file":
 		return s.readFile(args.Path)
+	case "write_file":
+		return s.writeFile(args.Path, args.Content)
 	case "file_info":
 		return s.fileInfo(args.Path)
 	case "grep":
@@ -311,6 +326,32 @@ func (s *server) readFile(path string) toolResult {
 	s.mu.Unlock()
 
 	return textResult(string(out))
+}
+
+// writeFile writes content to the worktree and invalidates the cache.
+func (s *server) writeFile(path, content string) toolResult {
+	if path == "" {
+		return errResult("path is required")
+	}
+	if strings.Contains(path, "..") {
+		return errResult("path must not contain '..'")
+	}
+
+	fullPath := filepath.Join(s.repoDir, path)
+
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		return errResult(fmt.Sprintf("create directory: %v", err))
+	}
+
+	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		return errResult(fmt.Sprintf("write file: %v", err))
+	}
+
+	s.mu.Lock()
+	delete(s.cache, path)
+	s.mu.Unlock()
+
+	return textResult(fmt.Sprintf("wrote %d bytes to %s", len(content), path))
 }
 
 // fileInfo runs `git ls-tree -l <ref> -- <path>` to get metadata.
