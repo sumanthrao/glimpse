@@ -5,8 +5,8 @@
 <h1 align="center">glimpse</h1>
 
 <p align="center">
-  <strong>Gaze into your codebase without checking it out.</strong><br>
-  Lazy in-memory file access for git repos — for humans via FUSE, for agents via MCP.
+  <strong>Faster git access for the agentic world.</strong><br>
+  FUSE-backed efficient repository checkout with lazy materialization for edits and trigram index for searches.
 </p>
 
 ---
