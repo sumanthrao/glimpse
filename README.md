@@ -71,107 +71,59 @@ Sparse checkout makes you answer *"what files do I need?"* before you start work
 
 ## Installation
 
-### MCP server (agents) — no dependencies beyond Go + git
-
 ```bash
 git clone https://github.com/sumanthrao/glimpse.git
 cd glimpse
-go build -o glimpse-mcp ./cmd/glimpse-mcp
+
+go build -o glimpse .               # CLI (no dependencies beyond Go + git)
+go build -o glimpse-mcp ./cmd/glimpse-mcp  # MCP server for AI agents
 ```
 
-This is the zero-friction path. No FUSE, no system packages — just the Go stdlib and the `git` CLI you already have.
+No FUSE, no system packages, no kernel extensions. Just Go and git.
 
-### FUSE mount (humans) — requires macFUSE or FUSE3
-
-```bash
-# macOS: install macFUSE first (reboot required)
-brew install --cask macfuse
-
-# Linux: install FUSE3
-sudo apt install fuse3 libfuse3-dev
-
-# Then build
-go build -o glimpse .
-```
-
-> **No macFUSE?** `glimpse` will detect this and tell you. The MCP server works everywhere without it.
+> **Optional:** If you want a FUSE filesystem mount, build `go build -o glimpse-fuse ./cmd/glimpse-fuse` (requires [macFUSE](https://osxfuse.github.io/) on macOS or FUSE3 on Linux).
 
 ## Usage
 
-### FUSE Mount (for developers)
+### Browse any repo — remote URL or local path
 
 ```bash
-# Mount any remote repo — no manual clone needed
-glimpse https://github.com/example/monorepo.git
+# List files in a remote repo (bare-clones on first use, cached after)
+glimpse https://github.com/org/monorepo.git
 
-# Browse the entire tree — directories resolve instantly
-ls monorepo/src/services/auth/
+# Read a file
+glimpse https://github.com/org/monorepo.git cat src/main.go
 
-# Reads are served from memory
-cat monorepo/src/services/auth/handler.go
+# Search across the repo
+glimpse https://github.com/org/monorepo.git grep "handleAuth"
 
-# Unmount
-# Press Ctrl+C, or:
-umount monorepo          # macOS
-fusermount -u monorepo   # Linux
+# Drill into a directory
+glimpse https://github.com/org/monorepo.git ls src/services/
+
+# SSH URLs work too
+glimpse git@github.com:org/repo.git cat README.md
 ```
 
-Or from a local repo you've already cloned:
+### From inside a local repo
 
 ```bash
 cd ~/repos/big-monorepo
-glimpse
 
-# Editing triggers materialization — git sees the file
-vim src/services/auth/handler.go
-git add src/services/auth/handler.go
-git commit -m "fix auth bug"
+glimpse ls src/
+glimpse cat src/services/auth/handler.go
+glimpse grep "TODO" src/
 ```
 
-### Options
+### Commands
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--repo` | *(auto-detected from cwd)* | Local path or remote URL (https/ssh) |
-| `--mount` | *(repo worktree or ./<repo-name>)* | Mount point directory |
-| `--ref` | `HEAD` | Git ref to mount (branch, tag, or commit hash) |
-| `--cache-dir` | `~/.cache/glimpse` | Where to store bare clones of remote repos |
-| `--ephemeral` | `false` | Skip sparse-checkout setup |
-| `--debug` | `false` | Enable FUSE debug logging |
+| Command | Description |
+|---------|-------------|
+| `glimpse <repo> ls [path]` | List files and directories |
+| `glimpse <repo> cat <file>` | Print file contents |
+| `glimpse <repo> grep <pattern> [path]` | Search file contents |
+| `glimpse <repo> serve` | Start MCP server for AI agents |
 
-### Examples
-
-```bash
-# Remote URL — bare-clones and mounts in ./monorepo
-glimpse https://github.com/org/monorepo.git
-
-# SSH URL
-glimpse git@github.com:org/monorepo.git
-
-# Explicit local repo
-glimpse --repo /path/to/repo
-
-# Mount a specific branch of a remote repo
-glimpse https://github.com/org/repo.git --ref feature/new-api
-
-# Auto-detect repo from cwd
-cd ~/repos/big-monorepo && glimpse
-```
-
-### Session Stats
-
-On unmount, glimpse shows what stayed in memory vs what hit disk:
-
-```
-Session stats:
-  Blobs fetched:             42
-  Bytes fetched:             168240
-  Served from memory:        35
-  Materialized to disk:      7
-  Directories listed:        12
-```
-
-42 files accessed, only 7 (the ones you edited) ever touched disk.
+Remote repos are bare-cloned into `~/.cache/glimpse/` and reused across sessions.
 
 ## Agent Integration (MCP Server)
 
@@ -291,19 +243,21 @@ go test ./... -v
 
 ```
 glimpse/
-├── main.go                  # FUSE CLI
+├── main.go                  # CLI (ls, cat, grep — no FUSE, no deps)
 ├── cmd/
-│   └── glimpse-mcp/
-│       └── main.go          # MCP server (zero deps, stdlib + git CLI)
+│   ├── glimpse-mcp/
+│   │   └── main.go          # MCP server (zero deps, stdlib + git CLI)
+│   └── glimpse-fuse/
+│       └── main.go          # Optional FUSE mount (requires macFUSE/FUSE3)
 ├── gitbackend/
-│   ├── backend.go           # Git object store access via go-git
-│   └── backend_test.go      # Backend unit tests
+│   ├── backend.go           # Git object store access via go-git (used by FUSE)
+│   └── backend_test.go
 ├── fusefs/
 │   ├── fs.go                # FUSE root, directory nodes, lazy tree population
 │   ├── file.go              # In-memory blob cache + materialize-on-write
 │   └── sparse.go            # Sparse-checkout integration
 ├── assets/
-│   └── glimpse-logo.png        # Logo
+│   └── glimpse-logo.png
 ├── go.mod
 └── README.md
 ```
