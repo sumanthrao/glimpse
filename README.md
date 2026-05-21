@@ -7,8 +7,8 @@
 <p align="center">
   <strong>Faster git access for the agentic world.</strong><br>
   FUSE-backed virtual checkout serving reads from the git object store in memory.<br>
-  Copy-on-write materialization to the sparse worktree on edit. Trigram-indexed <code>grep</code> in &lt;10ms.<br>
-  Zero-config for humans. MCP server with <code>open_repo</code> + bare-clone cache for agents.
+  Copy-on-write materialization to the sparse worktree on edit.<br>
+  Trigram-indexed grep for fast browsability.
 </p>
 
 ---
