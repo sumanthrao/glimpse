@@ -97,23 +97,14 @@ go build -o glimpse-mcp ./cmd/glimpse-mcp
 ### FUSE Mount (for developers)
 
 ```bash
-# Clone a huge repo (sparse — only .git is fetched)
-git clone --sparse https://github.com/example/monorepo.git
-cd monorepo
-
-# Mount
-glimpse
+# Mount any remote repo — no manual clone needed
+glimpse https://github.com/example/monorepo.git
 
 # Browse the entire tree — directories resolve instantly
-ls src/services/auth/
+ls monorepo/src/services/auth/
 
 # Reads are served from memory
-cat src/services/auth/handler.go
-
-# Editing triggers materialization — git sees the file
-vim src/services/auth/handler.go
-git add src/services/auth/handler.go
-git commit -m "fix auth bug"
+cat monorepo/src/services/auth/handler.go
 
 # Unmount
 # Press Ctrl+C, or:
@@ -121,30 +112,46 @@ umount monorepo          # macOS
 fusermount -u monorepo   # Linux
 ```
 
+Or from a local repo you've already cloned:
+
+```bash
+cd ~/repos/big-monorepo
+glimpse
+
+# Editing triggers materialization — git sees the file
+vim src/services/auth/handler.go
+git add src/services/auth/handler.go
+git commit -m "fix auth bug"
+```
+
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--repo` | *(auto-detected from cwd)* | Path to the git repository |
-| `--mount` | *(repo worktree)* | Directory to mount the filesystem on |
+| `--repo` | *(auto-detected from cwd)* | Local path or remote URL (https/ssh) |
+| `--mount` | *(repo worktree or ./<repo-name>)* | Mount point directory |
 | `--ref` | `HEAD` | Git ref to mount (branch, tag, or commit hash) |
-| `--ephemeral` | `false` | Ephemeral mode: skip sparse-checkout setup |
+| `--cache-dir` | `~/.cache/glimpse` | Where to store bare clones of remote repos |
+| `--ephemeral` | `false` | Skip sparse-checkout setup |
 | `--debug` | `false` | Enable FUSE debug logging |
 
 ### Examples
 
 ```bash
-# Auto-detect repo from cwd
-cd ~/repos/big-monorepo && glimpse
+# Remote URL — bare-clones and mounts in ./monorepo
+glimpse https://github.com/org/monorepo.git
 
-# Explicit repo path
+# SSH URL
+glimpse git@github.com:org/monorepo.git
+
+# Explicit local repo
 glimpse --repo /path/to/repo
 
-# Mount a specific branch
-glimpse --ref feature/new-api
+# Mount a specific branch of a remote repo
+glimpse https://github.com/org/repo.git --ref feature/new-api
 
-# Ephemeral mode (nothing persists to disk, ideal for agents)
-glimpse --ephemeral
+# Auto-detect repo from cwd
+cd ~/repos/big-monorepo && glimpse
 ```
 
 ### Session Stats
