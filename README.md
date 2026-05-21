@@ -71,26 +71,30 @@ Sparse checkout makes you answer *"what files do I need?"* before you start work
 
 ## Installation
 
-### Prerequisites
-
-- **Go 1.21+**
-- **macOS:** [macFUSE](https://osxfuse.github.io/) (`brew install macfuse`) — only for the FUSE mount
-- **Linux:** FUSE3 (`sudo apt install fuse3 libfuse3-dev`) — only for the FUSE mount
-
-The MCP server requires **only Go and git**. No FUSE needed.
-
-### Build
+### MCP server (agents) — no dependencies beyond Go + git
 
 ```bash
-git clone https://github.com/yourusername/glimpse.git
+git clone https://github.com/sumanthrao/glimpse.git
 cd glimpse
-
-# FUSE filesystem (for human developers)
-go build -o glimpse .
-
-# MCP server (for AI agents — no FUSE required)
 go build -o glimpse-mcp ./cmd/glimpse-mcp
 ```
+
+This is the zero-friction path. No FUSE, no system packages — just the Go stdlib and the `git` CLI you already have.
+
+### FUSE mount (humans) — requires macFUSE or FUSE3
+
+```bash
+# macOS: install macFUSE first (reboot required)
+brew install --cask macfuse
+
+# Linux: install FUSE3
+sudo apt install fuse3 libfuse3-dev
+
+# Then build
+go build -o glimpse .
+```
+
+> **No macFUSE?** `glimpse` will detect this and tell you. The MCP server works everywhere without it.
 
 ## Usage
 

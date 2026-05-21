@@ -86,6 +86,19 @@ func main() {
 		}
 	}
 
+	if !hasFUSE() {
+		fmt.Fprintf(os.Stderr, "error: FUSE is not available on this system.\n\n")
+		fmt.Fprintf(os.Stderr, "The glimpse FUSE mount requires:\n")
+		fmt.Fprintf(os.Stderr, "  macOS:  brew install --cask macfuse  (reboot after install)\n")
+		fmt.Fprintf(os.Stderr, "  Linux:  sudo apt install fuse3 libfuse3-dev\n\n")
+		fmt.Fprintf(os.Stderr, "Alternative: use the MCP server (no FUSE needed):\n")
+		fmt.Fprintf(os.Stderr, "  go build -o glimpse-mcp ./cmd/glimpse-mcp\n")
+		fmt.Fprintf(os.Stderr, "  glimpse-mcp --repo %s\n\n", absRepo)
+		fmt.Fprintf(os.Stderr, "The MCP server provides the same read/grep/write tools\n")
+		fmt.Fprintf(os.Stderr, "over the Model Context Protocol — works anywhere Go and git are installed.\n")
+		os.Exit(1)
+	}
+
 	if !*ephemeral {
 		if err := ensureSparseCheckout(absRepo); err != nil {
 			log.Fatalf("initialize sparse-checkout: %v", err)
@@ -233,6 +246,23 @@ func repoNameFromURL(url string) string {
 
 func isGitURL(s string) bool {
 	return strings.Contains(s, "://") || strings.HasPrefix(s, "git@")
+}
+
+// hasFUSE checks whether FUSE is available on this system.
+func hasFUSE() bool {
+	switch {
+	case fileExists("/Library/Filesystems/macfuse.fs") || fileExists("/usr/local/lib/libosxfuse.dylib"):
+		return true // macFUSE
+	case fileExists("/dev/fuse"):
+		return true // Linux FUSE
+	default:
+		return false
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // findGitRoot walks up from the cwd to find the nearest .git directory.
