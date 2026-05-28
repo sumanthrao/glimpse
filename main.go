@@ -273,15 +273,25 @@ Commands:
   find <url> <pattern> [path]  Find paths by substring or glob
   serve                        Start the MCP server (for AI agents)
 
+URL forms:
+  https://github.com/<owner>/<repo>                       full repo
+  https://github.com/<owner>/<repo>/tree/<ref>            full repo at <ref>
+  https://github.com/<owner>/<repo>/tree/<ref>/<path>     pin to a subtree
+  https://github.com/<owner>/<repo>/blob/<ref>/<file>     pin to file's parent dir
+
+Subtree pinning is recommended for monorepos that exceed the GitHub Trees
+API's ~7 MB / ~100k-entry cap; paths are then relative to the pinned subtree.
+
 Flags:
   --ref <ref>                  Branch, tag, or commit. Default: repo default branch.
   --cache-dir <dir>            Cache for lazy clones. Default: ~/.cache/glimpse.
   --github-token <token>       Auth token. Defaults to $GITHUB_TOKEN.
 
 Examples:
-  glimpse ls https://github.com/torvalds/linux
-  glimpse cat https://github.com/torvalds/linux README
+  glimpse ls   https://github.com/torvalds/linux
+  glimpse cat  https://github.com/torvalds/linux README
   glimpse grep https://github.com/torvalds/linux 'EXPORT_SYMBOL_GPL'
+  glimpse ls   'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations'
   glimpse serve   # start MCP server`)
 }
 

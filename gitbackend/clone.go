@@ -82,6 +82,10 @@ func (b *Backend) provisionWorktree(ctx context.Context) error {
 
 // WriteFile materializes a file under the lazy worktree. The first call
 // triggers EnsureWritable; subsequent calls just write.
+//
+// p is relative to the subtree, if one was pinned at Open time. The path
+// written into the worktree (and recorded in sparse-checkout) is the full
+// repo-relative path so commits stay anchored at the repo root.
 func (b *Backend) WriteFile(ctx context.Context, p, content string) error {
 	p = NormalizePath(p)
 	if p == "" {
@@ -94,14 +98,18 @@ func (b *Backend) WriteFile(ctx context.Context, p, content string) error {
 	if err != nil {
 		return err
 	}
-	full := filepath.Join(wt, p)
+	repoPath := p
+	if b.Ref.Subtree != "" {
+		repoPath = b.Ref.Subtree + "/" + p
+	}
+	full := filepath.Join(wt, repoPath)
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	if err := UpdateSparseCheckout(filepath.Join(wt, ".git"), p); err != nil {
+	if err := UpdateSparseCheckout(filepath.Join(wt, ".git"), repoPath); err != nil {
 		return fmt.Errorf("sparse-checkout: %w", err)
 	}
 	// Invalidate any cached blob bytes for this path's SHA so subsequent reads

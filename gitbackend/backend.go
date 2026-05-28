@@ -77,6 +77,12 @@ type Backend struct {
 	defaultBranch string
 	languages     map[string]int64
 	private       bool
+
+	// truncated is set when the GitHub Trees API returned a partial result
+	// (the repo or pinned subtree exceeds ~7 MB / 100k entries). The backend
+	// still operates on the entries it did receive; callers that care can
+	// surface this to the user via Stats.
+	truncated bool
 }
 
 // Open fetches the tree for ref and constructs a backend. Token is optional;
@@ -94,19 +100,75 @@ func Open(ctx context.Context, ref RepoRef, token, cacheDir string) (*Backend, e
 	gh := newGitHubClient(token)
 
 	// Resolve user-supplied ref (which may be empty) to a stable commit SHA.
-	resolvedRef, sha, err := gh.resolveCommit(ctx, ref.Owner, ref.Repo, ref.Ref)
+	// resolvedInfo is non-nil when ref was empty — we got the repo metadata
+	// along the way and can reuse it to avoid a duplicate fetch below.
+	resolvedRef, sha, resolvedInfo, err := gh.resolveCommit(ctx, ref.Owner, ref.Repo, ref.Ref)
 	if err != nil {
 		return nil, fmt.Errorf("resolve ref: %w", err)
 	}
 	ref.Ref = resolvedRef
 	ref.CommitSHA = sha
+	ref.Subtree = NormalizePath(ref.Subtree)
 
-	tr, err := gh.fetchTree(ctx, ref.Owner, ref.Repo, sha)
-	if err != nil {
-		return nil, fmt.Errorf("fetch tree: %w", err)
+	// Choose the tree-ish SHA to fetch from. For subtree-pinned URLs we walk
+	// down from the commit's root tree to the requested directory and fetch
+	// just that subtree, which keeps glimpse usable on monorepos that exceed
+	// the Trees API ~7 MB / 100k-entry cap.
+	treeSHA := sha
+	if ref.Subtree != "" {
+		subSHA, err := gh.resolveSubtreeSHA(ctx, ref.Owner, ref.Repo, sha, ref.Subtree)
+		if err != nil {
+			return nil, fmt.Errorf("resolve subtree %q: %w", ref.Subtree, err)
+		}
+		treeSHA = subSHA
+	}
+
+	// Tree fetch + repo metadata + languages are all independent of each
+	// other once the commit SHA is resolved. Fire them in parallel so the
+	// open path is bounded by the slowest single call (the tree) rather
+	// than the sum of three round trips.
+	var (
+		tr   *treeResponse
+		info repoInfo
+		langs map[string]int64
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		t, err := gh.fetchTree(gctx, ref.Owner, ref.Repo, treeSHA)
+		if err != nil {
+			return fmt.Errorf("fetch tree: %w", err)
+		}
+		tr = t
+		return nil
+	})
+	g.Go(func() error {
+		// Reuse metadata fetched during ref resolution when available.
+		if resolvedInfo != nil {
+			info = *resolvedInfo
+			return nil
+		}
+		// Best-effort; failures are tolerated.
+		_ = gh.doJSON(gctx, fmt.Sprintf("/repos/%s/%s", urlEscape(ref.Owner), urlEscape(ref.Repo)), &info)
+		return nil
+	})
+	g.Go(func() error {
+		langs, _ = gh.fetchLanguages(gctx, ref.Owner, ref.Repo)
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	if tr.Truncated {
-		return nil, fmt.Errorf("repo has more entries than the GitHub Trees API can return in one call (limit ~100k). v1 doesn't paginate; pin to a subtree by appending /tree/<branch>/<path> to the URL")
+		// Don't fail. The Trees API truncated the response (~7 MB / 100k
+		// entries). Whatever entries we did receive are still usable; the
+		// truncation is surfaced via Stats.Truncated and a stderr warning.
+		hint := "pin to a subtree by appending /tree/<branch>/<path> to the URL"
+		if ref.Subtree != "" {
+			hint = fmt.Sprintf("the pinned subtree %q is itself too large; pin deeper, e.g. /tree/<branch>/%s/<subdir>", ref.Subtree, ref.Subtree)
+		}
+		fmt.Fprintf(os.Stderr,
+			"glimpse: warning: tree was truncated by GitHub for %s; results may be partial. Hint: %s\n",
+			ref.String(), hint)
 	}
 
 	tree := make(map[string]Entry, len(tr.Tree))
@@ -134,12 +196,6 @@ func Open(ctx context.Context, ref RepoRef, token, cacheDir string) (*Backend, e
 		children[parent] = append(children[parent], entry)
 	}
 
-	// Best-effort metadata fetches; failures are tolerated and surfaced via Stats().
-	var info repoInfo
-	_ = gh.doJSON(ctx, fmt.Sprintf("/repos/%s/%s", urlEscape(ref.Owner), urlEscape(ref.Repo)), &info)
-
-	langs, _ := gh.fetchLanguages(ctx, ref.Owner, ref.Repo)
-
 	return &Backend{
 		Ref:           ref,
 		cacheDir:      cacheDir,
@@ -151,6 +207,7 @@ func Open(ctx context.Context, ref RepoRef, token, cacheDir string) (*Backend, e
 		defaultBranch: info.DefaultBranch,
 		languages:     langs,
 		private:       info.Private,
+		truncated:     tr.Truncated,
 	}, nil
 }
 
@@ -211,6 +268,8 @@ type Stats struct {
 	Writable     bool
 	Private      bool
 	WorktreeDir  string
+	Truncated    bool   // tree fetch hit the GitHub Trees API cap
+	Subtree      string // pinned subtree path, if any
 }
 
 func (b *Backend) Stats() Stats {
@@ -235,6 +294,8 @@ func (b *Backend) Stats() Stats {
 		Writable:     b.wtDir != "",
 		Private:      b.private,
 		WorktreeDir:  b.wtDir,
+		Truncated:    b.truncated,
+		Subtree:      b.Ref.Subtree,
 	}
 }
 
@@ -264,16 +325,27 @@ func (b *Backend) AccessFile(ctx context.Context, p string) ([]byte, error) {
 
 	// Tier 2: local disk if worktree exists and the file has been materialized
 	// (writes only). We do NOT consult the bare clone's pack — it has no blobs
-	// under --filter=blob:none.
+	// under --filter=blob:none. Worktree paths are full repo-relative even
+	// when the backend is subtree-pinned.
 	if b.wtDir != "" {
-		if data, err := os.ReadFile(filepath.Join(b.wtDir, p)); err == nil {
+		diskPath := p
+		if b.Ref.Subtree != "" {
+			diskPath = b.Ref.Subtree + "/" + p
+		}
+		if data, err := os.ReadFile(filepath.Join(b.wtDir, diskPath)); err == nil {
 			b.diskHits.Add(1)
 			b.populate(p, e.BlobSHA, data)
 			return data, nil
 		}
 	}
 
-	// Tier 3: CDN fetch, deduped by blob SHA.
+	// Tier 3: CDN fetch, deduped by blob SHA. Paths in the tree map are
+	// relative to b.Ref.Subtree (when set), but raw.githubusercontent.com
+	// expects the full repo-relative path.
+	rawPath := p
+	if b.Ref.Subtree != "" {
+		rawPath = b.Ref.Subtree + "/" + p
+	}
 	v, err, _ := b.inflight.Do(e.BlobSHA, func() (any, error) {
 		// Re-check cache after acquiring inflight slot — another caller may
 		// have populated it while we were waiting.
@@ -284,7 +356,7 @@ func (b *Backend) AccessFile(ctx context.Context, p string) ([]byte, error) {
 			return nil, err
 		}
 		defer b.sem.Release(1)
-		data, err := b.gh.fetchRawBlob(ctx, b.Ref.Owner, b.Ref.Repo, b.Ref.CommitSHA, p)
+		data, err := b.gh.fetchRawBlob(ctx, b.Ref.Owner, b.Ref.Repo, b.Ref.CommitSHA, rawPath)
 		if err != nil {
 			return nil, err
 		}

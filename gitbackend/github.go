@@ -207,7 +207,7 @@ type codeSearchHit struct {
 	URL  string `json:"url"`
 }
 
-// fetchTree fetches the recursive git tree at the given commit SHA. Returns
+// fetchTree fetches the recursive git tree at the given tree-ish SHA. Returns
 // an opaque struct that the backend converts into its tree map.
 func (c *githubClient) fetchTree(ctx context.Context, owner, repo, sha string) (*treeResponse, error) {
 	path := fmt.Sprintf("/repos/%s/%s/git/trees/%s?recursive=1", urlEscape(owner), urlEscape(repo), urlEscape(sha))
@@ -216,6 +216,47 @@ func (c *githubClient) fetchTree(ctx context.Context, owner, repo, sha string) (
 		return nil, err
 	}
 	return &t, nil
+}
+
+// fetchTreeFlat fetches the non-recursive tree at the given tree-ish SHA. Used
+// for stepping into a subtree one level at a time (which never truncates in
+// practice, since a single directory is small).
+func (c *githubClient) fetchTreeFlat(ctx context.Context, owner, repo, sha string) (*treeResponse, error) {
+	path := fmt.Sprintf("/repos/%s/%s/git/trees/%s", urlEscape(owner), urlEscape(repo), urlEscape(sha))
+	var t treeResponse
+	if err := c.doJSON(ctx, path, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// resolveSubtreeSHA walks rootSHA downward by name to find the tree SHA for
+// subPath. Used at Open time when a subtree-pinned URL is supplied. Returns
+// errNotFound if any path component is missing or not a directory.
+func (c *githubClient) resolveSubtreeSHA(ctx context.Context, owner, repo, rootSHA, subPath string) (string, error) {
+	subPath = strings.Trim(subPath, "/")
+	if subPath == "" {
+		return rootSHA, nil
+	}
+	cur := rootSHA
+	for _, name := range strings.Split(subPath, "/") {
+		t, err := c.fetchTreeFlat(ctx, owner, repo, cur)
+		if err != nil {
+			return "", err
+		}
+		next := ""
+		for _, e := range t.Tree {
+			if e.Path == name && e.Type == "tree" {
+				next = e.SHA
+				break
+			}
+		}
+		if next == "" {
+			return "", fmt.Errorf("subtree %q: directory not found at %q: %w", subPath, name, errNotFound)
+		}
+		cur = next
+	}
+	return cur, nil
 }
 
 type treeResponse struct {
@@ -235,30 +276,36 @@ type treeEntry struct {
 // resolveCommit takes a user-supplied ref (branch, tag, SHA, or "") and
 // returns the commit SHA that ref points at. An empty ref means the repo's
 // default branch.
-func (c *githubClient) resolveCommit(ctx context.Context, owner, repo, ref string) (string, string, error) {
+//
+// The third return value is the repo metadata fetched along the way when
+// ref was empty — non-nil only in that case. Callers can pass it forward
+// to skip a duplicate /repos/{owner}/{repo} call.
+func (c *githubClient) resolveCommit(ctx context.Context, owner, repo, ref string) (string, string, *repoInfo, error) {
+	var info *repoInfo
 	if ref == "" {
-		var info repoInfo
-		if err := c.doJSON(ctx, fmt.Sprintf("/repos/%s/%s", urlEscape(owner), urlEscape(repo)), &info); err != nil {
-			return "", "", err
+		var fetched repoInfo
+		if err := c.doJSON(ctx, fmt.Sprintf("/repos/%s/%s", urlEscape(owner), urlEscape(repo)), &fetched); err != nil {
+			return "", "", nil, err
 		}
-		ref = info.DefaultBranch
+		ref = fetched.DefaultBranch
 		if ref == "" {
-			return "", "", fmt.Errorf("could not resolve default branch for %s/%s", owner, repo)
+			return "", "", nil, fmt.Errorf("could not resolve default branch for %s/%s", owner, repo)
 		}
+		info = &fetched
 	}
 
 	// Already a SHA?
 	if isHexSHA(ref) {
-		return ref, ref, nil
+		return ref, ref, info, nil
 	}
 
 	// Try as branch first, then tag, then commit-ish via /commits/{ref}.
 	var commit commitInfo
 	if err := c.doJSON(ctx, fmt.Sprintf("/repos/%s/%s/commits/%s",
 		urlEscape(owner), urlEscape(repo), urlEscape(ref)), &commit); err != nil {
-		return "", "", fmt.Errorf("resolve ref %q: %w", ref, err)
+		return "", "", nil, fmt.Errorf("resolve ref %q: %w", ref, err)
 	}
-	return ref, commit.SHA, nil
+	return ref, commit.SHA, info, nil
 }
 
 type repoInfo struct {

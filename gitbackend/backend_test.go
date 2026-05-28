@@ -8,24 +8,28 @@ import (
 
 func TestParseGitHubURL(t *testing.T) {
 	cases := []struct {
-		in              string
-		owner, repo, ref string
-		wantErr         bool
+		in                       string
+		owner, repo, ref, subtree string
+		wantErr                  bool
 	}{
-		{"https://github.com/owner/repo", "owner", "repo", "", false},
-		{"https://github.com/owner/repo.git", "owner", "repo", "", false},
-		{"https://github.com/owner/repo/tree/main", "owner", "repo", "main", false},
-		{"https://github.com/owner/repo/blob/v1.2.3/README.md", "owner", "repo", "v1.2.3", false},
-		{"http://github.com/owner/repo", "owner", "repo", "", false},
-		{"github.com/owner/repo", "owner", "repo", "", false},
-		{"git@github.com:owner/repo.git", "owner", "repo", "", false},
-		{"git@github.com:owner/repo", "owner", "repo", "", false},
+		{"https://github.com/owner/repo", "owner", "repo", "", "", false},
+		{"https://github.com/owner/repo.git", "owner", "repo", "", "", false},
+		{"https://github.com/owner/repo/tree/main", "owner", "repo", "main", "", false},
+		{"https://github.com/owner/repo/tree/main/AIOperations", "owner", "repo", "main", "AIOperations", false},
+		{"https://github.com/owner/repo/tree/main/AIOperations/teams/spcs", "owner", "repo", "main", "AIOperations/teams/spcs", false},
+		{"https://github.com/owner/repo/tree/main/AIOperations/", "owner", "repo", "main", "AIOperations", false},
+		{"https://github.com/owner/repo/blob/v1.2.3/README.md", "owner", "repo", "v1.2.3", "", false},
+		{"https://github.com/owner/repo/blob/main/docs/setup.md", "owner", "repo", "main", "docs", false},
+		{"http://github.com/owner/repo", "owner", "repo", "", "", false},
+		{"github.com/owner/repo", "owner", "repo", "", "", false},
+		{"git@github.com:owner/repo.git", "owner", "repo", "", "", false},
+		{"git@github.com:owner/repo", "owner", "repo", "", "", false},
 
-		{"", "", "", "", true},
-		{"https://gitlab.com/owner/repo", "", "", "", true},
-		{"https://github.com/owner", "", "", "", true},
-		{"/local/path", "", "", "", true},
-		{"github.com/", "", "", "", true},
+		{"", "", "", "", "", true},
+		{"https://gitlab.com/owner/repo", "", "", "", "", true},
+		{"https://github.com/owner", "", "", "", "", true},
+		{"/local/path", "", "", "", "", true},
+		{"github.com/", "", "", "", "", true},
 	}
 
 	for _, tc := range cases {
@@ -37,9 +41,9 @@ func TestParseGitHubURL(t *testing.T) {
 		if tc.wantErr {
 			continue
 		}
-		if got.Owner != tc.owner || got.Repo != tc.repo || got.Ref != tc.ref {
-			t.Errorf("%q: got %+v, want owner=%s repo=%s ref=%s",
-				tc.in, got, tc.owner, tc.repo, tc.ref)
+		if got.Owner != tc.owner || got.Repo != tc.repo || got.Ref != tc.ref || got.Subtree != tc.subtree {
+			t.Errorf("%q: got %+v, want owner=%s repo=%s ref=%s subtree=%s",
+				tc.in, got, tc.owner, tc.repo, tc.ref, tc.subtree)
 		}
 	}
 }

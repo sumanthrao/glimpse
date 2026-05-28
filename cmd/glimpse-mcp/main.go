@@ -166,10 +166,19 @@ func toolDefs() []toolDef {
 	return []toolDef{
 		{
 			Name: "open_repo",
-			Description: "Open a github.com repo for exploration. Cost: 1 Trees API call (~300 ms). " +
-				"Call this once at the start of a session before any other tool. " +
-				"Returns repo metadata, languages, file count, and rate-limit state. " +
-				"URL accepts https://github.com/owner/repo, ...repo.git, ...repo/tree/<branch>, or git@github.com:owner/repo.git.",
+			Description: "Open a github.com repo for exploration. Cost: 1 Trees API call (~300 ms; " +
+				"a few extra calls when pinning to a subtree). Call this once at the start of a " +
+				"session before any other tool. Returns repo metadata, languages, file count, and " +
+				"rate-limit state.\n\n" +
+				"URL accepts:\n" +
+				"  https://github.com/owner/repo\n" +
+				"  https://github.com/owner/repo.git\n" +
+				"  https://github.com/owner/repo/tree/<ref>\n" +
+				"  https://github.com/owner/repo/tree/<ref>/<path>      (pins to a subtree)\n" +
+				"  https://github.com/owner/repo/blob/<ref>/<file>      (pins to file's parent dir)\n" +
+				"  git@github.com:owner/repo.git\n\n" +
+				"Use subtree pinning on monorepos too big for GitHub's ~7 MB / 100k-entry tree cap. " +
+				"All subsequent tool paths are then relative to the pinned subtree.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -304,10 +313,17 @@ Workflow:
   4. grep                                        -> Code Search + parallel fetch
   5. write_file / git_status / git_diff / git_commit -> first write triggers a one-time clone
 
+Subtree pinning (use this on monorepos):
+  open_repo("https://github.com/owner/repo/tree/<branch>/<path>")
+  GitHub's Trees API truncates at ~7 MB / 100k entries. A truncated session still
+  works for the entries that came back, but search and navigation are partial.
+  Pinning to /tree/<branch>/<path> fetches only that subtree's tree; subsequent
+  paths in find_files/list_directory/read_file/grep are relative to it.
+
 Tips:
   - Grep with a literal substring (3+ chars) for full-repo coverage. Pure regex only hits files already in RAM.
   - read_file is keyed by blob SHA, so two paths with identical content share one cached copy.
-  - repo_status surfaces rate-limit state. If you hit a 403, set GITHUB_TOKEN.
+  - repo_status surfaces rate-limit state and a 'truncated' flag if the tree was incomplete. If you hit a 403, set GITHUB_TOKEN.
   - glimpse_help prints this guide.
   - Only github.com URLs are supported. Other hosts return an error.`
 
@@ -417,18 +433,28 @@ func (s *server) openRepo(rawURL, ref string) toolResult {
 
 	stats := be.Stats()
 	resp := map[string]any{
-		"ok":          true,
-		"owner":       be.Ref.Owner,
-		"repo":        be.Ref.Repo,
-		"ref":         be.Ref.Ref,
-		"commit":      be.Ref.CommitSHA,
-		"private":     stats.Private,
-		"files":       stats.Files,
-		"dirs":        stats.Dirs,
-		"languages":   be.Languages(),
-		"open_ms":     time.Since(start).Milliseconds(),
-		"rate":        rateMap(stats.Rate),
-		"next_steps":  []string{"list_directory()", "find_files(\"*.go\")", "read_file(\"README.md\")", "grep(\"package main\")"},
+		"ok":         true,
+		"owner":      be.Ref.Owner,
+		"repo":       be.Ref.Repo,
+		"ref":        be.Ref.Ref,
+		"commit":     be.Ref.CommitSHA,
+		"subtree":    stats.Subtree,
+		"private":    stats.Private,
+		"files":      stats.Files,
+		"dirs":       stats.Dirs,
+		"truncated":  stats.Truncated,
+		"languages":  be.Languages(),
+		"open_ms":    time.Since(start).Milliseconds(),
+		"rate":       rateMap(stats.Rate),
+		"next_steps": []string{"list_directory()", "find_files(\"*.go\")", "read_file(\"README.md\")", "grep(\"package main\")"},
+	}
+	if stats.Truncated {
+		hint := "tree was truncated by the GitHub Trees API. " +
+			"Re-open with /tree/<branch>/<path> to pin to a subtree."
+		if stats.Subtree != "" {
+			hint = "subtree " + stats.Subtree + " was itself truncated; pin deeper, e.g. /tree/<branch>/" + stats.Subtree + "/<subdir>."
+		}
+		resp["truncation_note"] = hint
 	}
 	return jsonResult(resp)
 }
@@ -642,14 +668,16 @@ func repoStatus(be *gitbackend.Backend) toolResult {
 	stats := be.Stats()
 	resp := map[string]any{
 		"ref": map[string]any{
-			"owner":  be.Ref.Owner,
-			"repo":   be.Ref.Repo,
-			"ref":    be.Ref.Ref,
-			"commit": be.Ref.CommitSHA,
+			"owner":   be.Ref.Owner,
+			"repo":    be.Ref.Repo,
+			"ref":     be.Ref.Ref,
+			"commit":  be.Ref.CommitSHA,
+			"subtree": stats.Subtree,
 		},
 		"tree": map[string]any{
-			"files": stats.Files,
-			"dirs":  stats.Dirs,
+			"files":     stats.Files,
+			"dirs":      stats.Dirs,
+			"truncated": stats.Truncated,
 		},
 		"cache": map[string]any{
 			"ram_hits":      stats.RAMHits,

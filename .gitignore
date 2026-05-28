@@ -23,6 +23,8 @@ Thumbs.db
 
 # Upper layer dirs (runtime artifacts)
 *.upper/
-glimpse
-glimpse-mcp
-glimpse-fuse
+
+# Built binaries at repo root (anchored so we don't shadow cmd/glimpse-mcp/, etc.)
+/glimpse
+/glimpse-mcp
+/glimpse-fuse

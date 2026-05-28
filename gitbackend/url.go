@@ -10,11 +10,19 @@ import (
 // CommitSHA is filled in by Open after resolving Ref against the GitHub API.
 // All raw URL fetches use CommitSHA so reads stay consistent across a session
 // even if the branch advances upstream.
+//
+// Subtree pins the backend to a directory inside the repo. When set, Open
+// fetches only that subtree's recursive tree (instead of the whole repo)
+// which keeps glimpse usable on monorepos that exceed the GitHub Trees API
+// 7 MB / 100k-entry cap. Paths exposed by Lookup/Children/Tree are
+// relative to Subtree; the backend transparently prepends Subtree when it
+// fetches blobs from raw.githubusercontent.com.
 type RepoRef struct {
 	Owner     string
 	Repo      string
 	Ref       string // user-supplied: branch, tag, commit, or empty -> default branch
 	CommitSHA string // resolved at Open time
+	Subtree   string // optional: directory prefix from /tree/<ref>/<path> URLs
 }
 
 // ParseGitHubURL accepts the common spellings of a github.com URL and rejects
@@ -25,6 +33,8 @@ type RepoRef struct {
 //	https://github.com/owner/repo
 //	https://github.com/owner/repo.git
 //	https://github.com/owner/repo/tree/<branch>
+//	https://github.com/owner/repo/tree/<branch>/<path>      (pins to a subtree)
+//	https://github.com/owner/repo/blob/<branch>/<path>      (pins to <path>'s parent dir)
 //	git@github.com:owner/repo.git
 //	github.com/owner/repo
 //
@@ -45,7 +55,7 @@ func ParseGitHubURL(s string) (RepoRef, error) {
 		if err != nil {
 			return RepoRef{}, fmt.Errorf("parse ssh URL %q: %w", orig, err)
 		}
-		return RepoRef{Owner: owner, Repo: repo, Ref: ref}, nil
+		return RepoRef{Owner: owner, Repo: repo, Ref: ref, Subtree: ""}, nil
 	}
 
 	// Strip scheme.
@@ -62,7 +72,8 @@ func ParseGitHubURL(s string) (RepoRef, error) {
 	}
 	s = strings.TrimPrefix(s, "github.com/")
 
-	// At this point s should start with owner/repo and may have /tree/<ref> or /blob/<ref>/... after it.
+	// At this point s should start with owner/repo optionally followed by
+	// /tree/<ref>/<path...> or /blob/<ref>/<path...>.
 	parts := strings.SplitN(s, "/", 5)
 	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
 		return RepoRef{}, fmt.Errorf("expected owner/repo in URL: %q", orig)
@@ -73,12 +84,25 @@ func ParseGitHubURL(s string) (RepoRef, error) {
 		return RepoRef{}, fmt.Errorf("expected repo name in URL: %q", orig)
 	}
 
-	// Optional /tree/<ref>... or /blob/<ref>/<path>...
+	subtree := ""
 	if len(parts) >= 4 && (parts[2] == "tree" || parts[2] == "blob") {
 		ref = parts[3]
+		if len(parts) == 5 && parts[4] != "" {
+			tail := strings.TrimSuffix(parts[4], "/")
+			if parts[2] == "blob" {
+				// /blob/<ref>/<path> points at a file; pin to its parent dir
+				// so the user can navigate around it.
+				if i := strings.LastIndex(tail, "/"); i >= 0 {
+					tail = tail[:i]
+				} else {
+					tail = ""
+				}
+			}
+			subtree = tail
+		}
 	}
 
-	return RepoRef{Owner: owner, Repo: repo, Ref: ref}, nil
+	return RepoRef{Owner: owner, Repo: repo, Ref: ref, Subtree: subtree}, nil
 }
 
 func splitOwnerRepo(s string) (string, string, error) {
@@ -91,16 +115,20 @@ func splitOwnerRepo(s string) (string, string, error) {
 }
 
 // String renders RepoRef as a short human label like "owner/repo@HEAD" or
-// "owner/repo@main (abc1234)" once a CommitSHA is resolved.
+// "owner/repo@main (abc1234)[/subtree]" once resolved.
 func (r RepoRef) String() string {
 	ref := r.Ref
 	if ref == "" {
 		ref = "HEAD"
 	}
-	if r.CommitSHA != "" {
-		return fmt.Sprintf("%s/%s@%s (%s)", r.Owner, r.Repo, ref, shortSHA(r.CommitSHA))
+	suffix := ""
+	if r.Subtree != "" {
+		suffix = "/" + r.Subtree
 	}
-	return fmt.Sprintf("%s/%s@%s", r.Owner, r.Repo, ref)
+	if r.CommitSHA != "" {
+		return fmt.Sprintf("%s/%s@%s (%s)%s", r.Owner, r.Repo, ref, shortSHA(r.CommitSHA), suffix)
+	}
+	return fmt.Sprintf("%s/%s@%s%s", r.Owner, r.Repo, ref, suffix)
 }
 
 func shortSHA(s string) string {

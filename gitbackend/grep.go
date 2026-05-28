@@ -90,7 +90,19 @@ func (b *Backend) Grep(ctx context.Context, pattern, pathScope string) (*GrepRes
 		return res, nil
 	}
 
-	hits, err := b.gh.codeSearch(ctx, b.Ref.Owner, b.Ref.Repo, literals, pathScope)
+	// Code Search wants a repo-rooted path. When the backend is subtree-pinned
+	// we translate the user-supplied (subtree-relative) pathScope into a
+	// repo-rooted scope for the API call, then translate hits back below.
+	apiScope := pathScope
+	if b.Ref.Subtree != "" {
+		if pathScope == "" {
+			apiScope = b.Ref.Subtree
+		} else {
+			apiScope = b.Ref.Subtree + "/" + pathScope
+		}
+	}
+
+	hits, err := b.gh.codeSearch(ctx, b.Ref.Owner, b.Ref.Repo, literals, apiScope)
 	if err != nil {
 		// Soft fail — return what we have from the local index plus the error
 		// note. Agent can retry with a token if rate-limited.
@@ -101,23 +113,34 @@ func (b *Backend) Grep(ctx context.Context, pattern, pathScope string) (*GrepRes
 	}
 
 	// Filter out paths already covered by the local index — saves redundant
-	// downloads and prevents duplicate matches.
+	// downloads and prevents duplicate matches. Code Search returns full
+	// repo-relative paths; convert them to subtree-relative if pinned.
 	var fetchPaths []string
 	seenPath := map[string]struct{}{}
 	for _, m := range res.Matches {
 		seenPath[m.Path] = struct{}{}
 	}
 	for _, h := range hits {
-		if pathScope != "" && !strings.HasPrefix(h.Path, pathScope) {
+		p := h.Path
+		if b.Ref.Subtree != "" {
+			prefix := b.Ref.Subtree + "/"
+			if !strings.HasPrefix(p, prefix) {
+				// Code Search may surface hits outside our subtree if the
+				// path: filter didn't fully constrain them. Drop those.
+				continue
+			}
+			p = strings.TrimPrefix(p, prefix)
+		}
+		if pathScope != "" && !strings.HasPrefix(p, pathScope) {
 			continue
 		}
-		if b.idx.Has(h.Path) {
+		if b.idx.Has(p) {
 			continue
 		}
-		if _, dup := seenPath[h.Path]; dup {
+		if _, dup := seenPath[p]; dup {
 			continue
 		}
-		fetchPaths = append(fetchPaths, h.Path)
+		fetchPaths = append(fetchPaths, p)
 	}
 
 	res.Search.CodeSearch = CodeSearchStrategy{
