@@ -2,35 +2,31 @@ package fusefs
 
 import (
 	"context"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-// gitFile is a file backed by a git blob. Reads are served from an in-memory
-// cache (no disk I/O). The file is only materialized to the real worktree when
-// a write or truncate occurs, preserving git compatibility for edits while
-// keeping pure reads entirely in memory.
+// gitFile is a file backed by the GitHub repo tree. Reads go through
+// Backend.AccessFile (RAM cache → disk if worktree exists → CDN). Writes
+// trigger backend.WriteFile, which lazily provisions a worktree the first
+// time it's called.
 type gitFile struct {
 	fs.Inode
 
-	gitFS    *GitFS
-	blobHash plumbing.Hash
-	size     uint64
-	mode     uint32
-	relPath  string
-	diskPath string
+	gitFS   *GitFS
+	relPath string
+	size    uint64
+	mode    uint32
 
 	mu           sync.Mutex
-	cachedData   []byte // in-memory blob content; nil until first read
-	materialized bool   // true once flushed to disk (write triggered)
+	cached       []byte // populated by AccessFile on first read
+	materialized bool   // true after a write — disk is authoritative
 }
 
 var _ = (fs.NodeGetattrer)((*gitFile)(nil))
@@ -44,18 +40,17 @@ func (f *gitFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrO
 	defer f.mu.Unlock()
 
 	if f.materialized {
-		info, err := os.Stat(f.diskPath)
-		if err == nil {
+		if info, err := os.Stat(f.diskPath()); err == nil {
 			out.Size = uint64(info.Size())
 			out.Mode = uint32(info.Mode())
-			modTime := info.ModTime()
-			out.SetTimes(&modTime, &modTime, &modTime)
+			t := info.ModTime()
+			out.SetTimes(&t, &t, &t)
 			return 0
 		}
 	}
 
-	if f.cachedData != nil {
-		out.Size = uint64(len(f.cachedData))
+	if f.cached != nil {
+		out.Size = uint64(len(f.cached))
 	} else {
 		out.Size = f.size
 	}
@@ -74,30 +69,46 @@ func (f *gitFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 	defer f.mu.Unlock()
 
 	if f.materialized {
-		data, err := os.ReadFile(f.diskPath)
+		data, err := os.ReadFile(f.diskPath())
 		if err != nil {
 			return nil, syscall.EIO
 		}
-		return fuse.ReadResultData(sliceData(data, off, len(dest))), 0
+		return fuse.ReadResultData(slice(data, off, len(dest))), 0
 	}
 
-	if err := f.ensureCached(); err != nil {
-		return nil, syscall.EIO
+	if f.cached == nil {
+		data, err := f.gitFS.backend.AccessFile(ctx, f.relPath)
+		if err != nil {
+			return nil, syscall.EIO
+		}
+		f.cached = data
 	}
-
-	return fuse.ReadResultData(sliceData(f.cachedData, off, len(dest))), 0
+	return fuse.ReadResultData(slice(f.cached, off, len(dest))), 0
 }
 
 func (f *gitFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if err := f.ensureMaterialized(); err != nil {
-		return 0, syscall.EIO
+	if !f.materialized {
+		// Seed worktree with the current bytes (or empty if we never read).
+		if f.cached == nil {
+			// Best-effort fetch; if the file truly doesn't exist on origin
+			// we still create it locally below.
+			if cur, err := f.gitFS.backend.AccessFile(ctx, f.relPath); err == nil {
+				f.cached = cur
+			}
+		}
+		seed := string(f.cached)
+		if err := f.gitFS.backend.WriteFile(ctx, f.relPath, seed); err != nil {
+			return 0, syscall.EIO
+		}
+		f.materialized = true
+		f.cached = nil
 	}
 
-	existing, _ := os.ReadFile(f.diskPath)
-
+	full := f.diskPath()
+	existing, _ := os.ReadFile(full)
 	end := int64(len(data)) + off
 	if end > int64(len(existing)) {
 		grown := make([]byte, end)
@@ -105,11 +116,9 @@ func (f *gitFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off 
 		existing = grown
 	}
 	copy(existing[off:], data)
-
-	if err := os.WriteFile(f.diskPath, existing, os.FileMode(f.mode)); err != nil {
+	if err := os.WriteFile(full, existing, os.FileMode(f.mode)); err != nil {
 		return 0, syscall.EIO
 	}
-
 	f.size = uint64(len(existing))
 	return uint32(len(data)), 0
 }
@@ -119,87 +128,42 @@ func (f *gitFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 		f.mu.Lock()
 		defer f.mu.Unlock()
 
-		if err := f.ensureMaterialized(); err != nil {
-			return syscall.EIO
+		if !f.materialized {
+			seed := ""
+			if f.cached != nil {
+				seed = string(f.cached)
+			}
+			if err := f.gitFS.backend.WriteFile(ctx, f.relPath, seed); err != nil {
+				return syscall.EIO
+			}
+			f.materialized = true
+			f.cached = nil
 		}
-
-		if err := os.Truncate(f.diskPath, int64(sz)); err != nil {
+		if err := os.Truncate(f.diskPath(), int64(sz)); err != nil {
 			return syscall.EIO
 		}
 		f.size = sz
 	}
-
 	out.Size = f.size
 	out.Mode = f.mode
 	return 0
 }
 
-// ensureCached fetches the blob from git into memory if not already present.
-// Must be called with f.mu held.
-func (f *gitFile) ensureCached() error {
-	if f.cachedData != nil || f.materialized {
-		return nil
+// diskPath resolves the worktree-side absolute path for this file. Only
+// meaningful after materialization (write or truncate).
+func (f *gitFile) diskPath() string {
+	wt := f.gitFS.backend.WorktreeDir()
+	if wt == "" {
+		return ""
 	}
-
-	data, err := f.gitFS.backend.ReadBlob(f.blobHash)
-	if err != nil {
-		log.Printf("cache %s: read blob: %v", f.relPath, err)
-		return err
-	}
-
-	f.cachedData = data
-
-	f.gitFS.mu.Lock()
-	f.gitFS.blobsRead++
-	f.gitFS.bytesRead += int64(len(data))
-	f.gitFS.mu.Unlock()
-
-	log.Printf("cached %s (%d bytes, in-memory)", f.relPath, len(data))
-	return nil
+	return filepath.Join(wt, f.relPath)
 }
 
-// ensureMaterialized writes the file to the real worktree and updates
-// sparse-checkout. Called only on write/truncate operations.
-// Must be called with f.mu held.
-func (f *gitFile) ensureMaterialized() error {
-	if f.materialized {
-		return nil
-	}
-
-	if err := f.ensureCached(); err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(f.diskPath), 0o755); err != nil {
-		log.Printf("materialize %s: mkdir: %v", f.relPath, err)
-		return err
-	}
-
-	if err := os.WriteFile(f.diskPath, f.cachedData, os.FileMode(f.mode)); err != nil {
-		log.Printf("materialize %s: write: %v", f.relPath, err)
-		return err
-	}
-
-	if err := UpdateSparseCheckout(f.gitFS.gitDir, f.relPath); err != nil {
-		log.Printf("materialize %s: sparse-checkout: %v", f.relPath, err)
-	}
-
-	f.materialized = true
-	f.cachedData = nil // disk is authoritative now; free the memory
-
-	f.gitFS.mu.Lock()
-	f.gitFS.diskMaterializations++
-	f.gitFS.mu.Unlock()
-
-	log.Printf("materialized %s to disk (write triggered)", f.relPath)
-	return nil
-}
-
-func sliceData(data []byte, off int64, destLen int) []byte {
+func slice(data []byte, off int64, n int) []byte {
 	if int(off) >= len(data) {
 		return nil
 	}
-	end := int(off) + destLen
+	end := int(off) + n
 	if end > len(data) {
 		end = len(data)
 	}

@@ -1,177 +1,256 @@
-// glimpse: fast git repo browsing from the command line.
-// No FUSE, no system dependencies — just Go and the git CLI.
+// Command glimpse is a thin CLI for browsing github.com repos without cloning.
 //
-// Usage:
-//
-//	glimpse <url-or-path> [command] [args...]
-//	glimpse ls [path]
-//	glimpse cat <file>
-//	glimpse grep <pattern> [path]
-//	glimpse serve                   # start MCP server
+// All operations route through the gitbackend package, so glimpse and
+// glimpse-mcp share one cache and one set of semantics. Only github.com URLs
+// are accepted.
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
+
+	"github.com/surao/gitfs-accelerator/gitbackend"
+)
+
+var (
+	flagSet  = flag.NewFlagSet("glimpse", flag.ExitOnError)
+	cacheDir = flagSet.String("cache-dir", "", "Cache for partial clones (default: ~/.cache/glimpse)")
+	tokenF   = flagSet.String("github-token", "", "GitHub token; defaults to $GITHUB_TOKEN")
+	refF     = flagSet.String("ref", "", "Git ref (branch, tag, commit). Empty = default branch.")
 )
 
 func main() {
-	args := os.Args[1:]
-
-	if len(args) == 0 {
+	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
 	}
 
-	// Parse: first arg might be a URL/path (repo target) or a subcommand
-	repo, cmd, cmdArgs := parseArgs(args)
-
-	home, _ := os.UserHomeDir()
-	cacheDir := filepath.Join(home, ".cache", "glimpse")
-
-	repoDir, err := resolveRepo(repo, cacheDir)
-	if err != nil {
-		die("%v", err)
-	}
-
-	ref := "HEAD"
+	args, cmd := parse(os.Args[1:])
 
 	switch cmd {
 	case "ls":
-		path := ""
-		if len(cmdArgs) > 0 {
-			path = cmdArgs[0]
-		}
-		lsTree(repoDir, ref, path)
-
+		runLs(args)
 	case "cat":
-		if len(cmdArgs) == 0 {
-			die("usage: glimpse cat <file>")
-		}
-		catFile(repoDir, ref, cmdArgs[0])
-
+		runCat(args)
 	case "grep":
-		if len(cmdArgs) == 0 {
-			die("usage: glimpse grep <pattern> [path]")
-		}
-		pattern := cmdArgs[0]
-		path := ""
-		if len(cmdArgs) > 1 {
-			path = cmdArgs[1]
-		}
-		grepRepo(repoDir, ref, pattern, path)
-
+		runGrep(args)
+	case "info":
+		runInfo(args)
+	case "find":
+		runFind(args)
 	case "serve":
-		serveMCP(repoDir)
-
+		runServe()
+	case "help", "--help", "-h":
+		usage()
 	default:
-		// If no recognized command, treat it as "ls" on the repo root
-		lsTree(repoDir, ref, "")
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
+		usage()
+		os.Exit(1)
 	}
 }
 
-func parseArgs(args []string) (repo, cmd string, cmdArgs []string) {
-	commands := map[string]bool{"ls": true, "cat": true, "grep": true, "serve": true}
-
-	// If first arg is a known command, infer repo from cwd
-	if commands[args[0]] {
-		return "", args[0], args[1:]
+// parse pulls global flags out of the command line, then returns the
+// remaining positional args and the chosen subcommand.
+func parse(in []string) ([]string, string) {
+	// Find the subcommand: first non-flag argument that names a known command.
+	commands := map[string]bool{
+		"ls": true, "cat": true, "grep": true, "info": true, "find": true,
+		"serve": true, "help": true, "--help": true, "-h": true,
 	}
-
-	// First arg is the repo
-	repo = args[0]
-	if len(args) > 1 && commands[args[1]] {
-		return repo, args[1], args[2:]
+	var head []string
+	cmd := ""
+	rest := []string{}
+	for i, a := range in {
+		if commands[a] {
+			cmd = a
+			rest = in[i+1:]
+			break
+		}
+		head = append(head, a)
 	}
-
-	// No command — default to "ls"
-	return repo, "ls", args[1:]
+	if cmd == "" {
+		// No subcommand; treat all as global flags + assume "ls".
+		cmd = "ls"
+		rest = nil
+	}
+	if err := flagSet.Parse(head); err != nil {
+		os.Exit(2)
+	}
+	return rest, cmd
 }
 
-// ---------------------------------------------------------------------------
-// Commands
-// ---------------------------------------------------------------------------
-
-func lsTree(repoDir, ref, path string) {
-	args := []string{"-C", repoDir, "ls-tree", "-l", ref}
-	if path != "" {
-		path = strings.TrimSuffix(path, "/")
-		args = append(args, "--", path+"/")
+func resolveCacheDir() string {
+	if *cacheDir != "" {
+		return *cacheDir
 	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cache", "glimpse")
+}
 
-	out, err := exec.Command("git", args...).Output()
+func resolveToken() string {
+	if *tokenF != "" {
+		return *tokenF
+	}
+	return os.Getenv("GITHUB_TOKEN")
+}
+
+// openBackend opens the URL passed as args[0]. Returns the backend, the
+// remaining args, and a function that closes (currently a no-op).
+func openBackend(args []string) (*gitbackend.Backend, []string) {
+	if len(args) == 0 {
+		die("missing github.com URL. Example: glimpse ls https://github.com/torvalds/linux")
+	}
+	parsed, err := gitbackend.ParseGitHubURL(args[0])
 	if err != nil {
-		die("not found: %s", path)
+		die("%v", err)
+	}
+	if *refF != "" {
+		parsed.Ref = *refF
 	}
 
-	prefix := ""
-	if path != "" {
-		prefix = path + "/"
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		tab := strings.SplitN(line, "\t", 2)
-		if len(tab) != 2 {
-			continue
-		}
-		name := strings.TrimPrefix(tab[1], prefix)
-		meta := strings.Fields(tab[0])
-		if len(meta) < 4 {
-			continue
-		}
-		if meta[1] == "tree" {
-			fmt.Printf("  %s/\n", name)
-		} else {
-			fmt.Printf("  %-40s %s bytes\n", name, meta[3])
-		}
+	be, err := gitbackend.Open(ctx, parsed, resolveToken(), resolveCacheDir())
+	if err != nil {
+		die("open repo: %v", err)
 	}
+	return be, args[1:]
 }
 
-func catFile(repoDir, ref, path string) {
-	out, err := exec.Command("git", "-C", repoDir, "show", ref+":"+path).Output()
-	if err != nil {
-		die("not found: %s", path)
+func runLs(args []string) {
+	be, rest := openBackend(args)
+	dir := ""
+	if len(rest) > 0 {
+		dir = rest[0]
 	}
-	os.Stdout.Write(out)
-}
-
-func grepRepo(repoDir, ref, pattern, path string) {
-	args := []string{"-C", repoDir, "grep", "-n", "-I", pattern, ref}
-	if path != "" {
-		args = append(args, "--", path)
-	}
-
-	out, err := exec.Command("git", args...).Output()
-	if err != nil {
-		fmt.Println("no matches found")
+	dir = gitbackend.NormalizePath(dir)
+	children := be.Children(dir)
+	if len(children) == 0 {
+		if _, ok := be.Lookup(dir); !ok && dir != "" {
+			die("not found: %s", dir)
+		}
 		return
 	}
-
-	prefix := ref + ":"
-	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
-		fmt.Println(strings.TrimPrefix(line, prefix))
+	sort.Slice(children, func(i, j int) bool { return children[i].Path < children[j].Path })
+	for _, e := range children {
+		base := filepath.Base(e.Path)
+		if e.IsDir {
+			fmt.Printf("  %s/\n", base)
+		} else {
+			fmt.Printf("  %-40s %d bytes\n", base, e.Size)
+		}
 	}
 }
 
-func serveMCP(repoDir string) {
-	// Exec the MCP server binary if available, otherwise tell the user to build it
-	mcpBin, err := exec.LookPath("glimpse-mcp")
+func runCat(args []string) {
+	be, rest := openBackend(args)
+	if len(rest) == 0 {
+		die("usage: glimpse cat <url> <path>")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	data, err := be.AccessFile(ctx, rest[0])
 	if err != nil {
-		// Try next to our own binary
+		die("%v", err)
+	}
+	_, _ = io.Copy(os.Stdout, strings.NewReader(string(data)))
+}
+
+func runGrep(args []string) {
+	be, rest := openBackend(args)
+	if len(rest) == 0 {
+		die("usage: glimpse grep <url> <pattern> [path]")
+	}
+	pattern := rest[0]
+	scope := ""
+	if len(rest) > 1 {
+		scope = rest[1]
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	res, err := be.Grep(ctx, pattern, scope)
+	if err != nil {
+		die("%v", err)
+	}
+	if res.Note != "" {
+		fmt.Fprintln(os.Stderr, "note:", res.Note)
+	}
+	for _, m := range res.Matches {
+		fmt.Printf("%s:%d:%s\n", m.Path, m.Line, m.Text)
+	}
+}
+
+func runInfo(args []string) {
+	be, rest := openBackend(args)
+	if len(rest) == 0 {
+		die("usage: glimpse info <url> <path>")
+	}
+	e, ok := be.Lookup(rest[0])
+	if !ok {
+		die("not found: %s", rest[0])
+	}
+	out := map[string]any{
+		"path":     e.Path,
+		"is_dir":   e.IsDir,
+		"size":     e.Size,
+		"mode":     fmt.Sprintf("%o", e.Mode),
+		"blob_sha": e.BlobSHA,
+	}
+	b, _ := json.MarshalIndent(out, "", "  ")
+	fmt.Println(string(b))
+}
+
+func runFind(args []string) {
+	be, rest := openBackend(args)
+	if len(rest) == 0 {
+		die("usage: glimpse find <url> <pattern> [scope]")
+	}
+	pattern := rest[0]
+	scope := ""
+	if len(rest) > 1 {
+		scope = rest[1]
+	}
+	scope = gitbackend.NormalizePath(scope)
+	for p, e := range be.Tree() {
+		if scope != "" && !strings.HasPrefix(p, scope) {
+			continue
+		}
+		if !strings.Contains(p, pattern) {
+			ok, _ := filepath.Match(pattern, filepath.Base(p))
+			if !ok {
+				continue
+			}
+		}
+		if e.IsDir {
+			fmt.Printf("dir  %s\n", p)
+		} else {
+			fmt.Printf("file %s (%d bytes)\n", p, e.Size)
+		}
+	}
+}
+
+func runServe() {
+	mcp, err := exec.LookPath("glimpse-mcp")
+	if err != nil {
 		self, _ := os.Executable()
-		mcpBin = filepath.Join(filepath.Dir(self), "glimpse-mcp")
-		if _, err := os.Stat(mcpBin); err != nil {
+		mcp = filepath.Join(filepath.Dir(self), "glimpse-mcp")
+		if _, err := os.Stat(mcp); err != nil {
 			die("glimpse-mcp not found. Build it:\n  go build -o glimpse-mcp ./cmd/glimpse-mcp")
 		}
 	}
-
-	cmd := exec.Command(mcpBin, "--repo", repoDir)
+	cmd := exec.Command(mcp)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -180,107 +259,30 @@ func serveMCP(repoDir string) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Repo resolution (clone remote URLs, use local paths directly)
-// ---------------------------------------------------------------------------
-
-func resolveRepo(repoOrURL, cacheDir string) (string, error) {
-	if repoOrURL == "" {
-		return findGitRoot()
-	}
-
-	if isGitURL(repoOrURL) {
-		return cloneOrFetch(repoOrURL, cacheDir)
-	}
-
-	abs, err := filepath.Abs(repoOrURL)
-	if err != nil {
-		return "", fmt.Errorf("resolve path: %w", err)
-	}
-
-	// Check for normal repo (.git dir) or bare repo (HEAD file)
-	if fileExists(filepath.Join(abs, ".git")) || fileExists(filepath.Join(abs, "HEAD")) {
-		return abs, nil
-	}
-	return "", fmt.Errorf("not a git repository: %s", abs)
-}
-
-func cloneOrFetch(url, cacheDir string) (string, error) {
-	dir := repoCacheDir(cacheDir, url)
-
-	if fileExists(filepath.Join(dir, "HEAD")) {
-		fmt.Fprintf(os.Stderr, "cached: %s\n", dir)
-		cmd := exec.Command("git", "-C", dir, "fetch", "--quiet", "origin")
-		cmd.Stderr = os.Stderr
-		_ = cmd.Run()
-		return dir, nil
-	}
-
-	fmt.Fprintf(os.Stderr, "cloning %s ...\n", url)
-	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
-		return "", err
-	}
-	cmd := exec.Command("git", "clone", "--bare", "--quiet", url, dir)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git clone --bare: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "ready: %s\n", dir)
-	return dir, nil
-}
-
-func repoCacheDir(cacheDir, url string) string {
-	name := strings.TrimSuffix(url, ".git")
-	r := strings.NewReplacer("://", "-", "/", "-", ":", "-", "@", "-")
-	return filepath.Join(cacheDir, r.Replace(name))
-}
-
-func isGitURL(s string) bool {
-	return strings.Contains(s, "://") || strings.HasPrefix(s, "git@")
-}
-
-func findGitRoot() (string, error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	for {
-		if fileExists(filepath.Join(dir, ".git")) {
-			return dir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("not inside a git repo — pass a URL or path:\n  glimpse https://github.com/org/repo.git\n  glimpse /path/to/local/repo")
-		}
-		dir = parent
-	}
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
 func usage() {
-	fmt.Fprintf(os.Stderr, `glimpse — fast git repo browsing. No checkout needed.
+	fmt.Fprintln(os.Stderr, `glimpse — github.com repos without cloning.
 
 Usage:
-  glimpse <url-or-path> [command] [args...]
+  glimpse [flags] <command> <url> [args...]
 
 Commands:
-  ls   [path]            List files and directories
-  cat  <file>            Print file contents
-  grep <pattern> [path]  Search file contents
-  serve                  Start MCP server (for AI agents)
+  ls   <url> [path]            List directory entries
+  cat  <url> <path>            Print file contents (CDN fetch, cached)
+  grep <url> <pattern> [path]  Search file contents (Code Search + CDN)
+  info <url> <path>            Show file metadata
+  find <url> <pattern> [path]  Find paths by substring or glob
+  serve                        Start the MCP server (for AI agents)
+
+Flags:
+  --ref <ref>                  Branch, tag, or commit. Default: repo default branch.
+  --cache-dir <dir>            Cache for lazy clones. Default: ~/.cache/glimpse.
+  --github-token <token>       Auth token. Defaults to $GITHUB_TOKEN.
 
 Examples:
-  glimpse https://github.com/org/repo.git          # clone + list root
-  glimpse https://github.com/org/repo.git ls src/   # list src/
-  glimpse https://github.com/org/repo.git cat README.md
-  glimpse https://github.com/org/repo.git grep "func main"
-  glimpse cat src/main.go                           # if inside a repo
-  glimpse serve                                     # start MCP server
-`)
+  glimpse ls https://github.com/torvalds/linux
+  glimpse cat https://github.com/torvalds/linux README
+  glimpse grep https://github.com/torvalds/linux 'EXPORT_SYMBOL_GPL'
+  glimpse serve   # start MCP server`)
 }
 
 func die(format string, args ...any) {

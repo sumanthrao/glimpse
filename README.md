@@ -5,292 +5,140 @@
 <h1 align="center">glimpse</h1>
 
 <p align="center">
-  <strong>Faster git access for the agentic world.</strong><br>
-  FUSE-backed virtual checkout serving reads from the git object store in memory.<br>
-  Copy-on-write materialization to the sparse worktree on edit.<br>
-  Trigram-indexed grep for fast browsability.
+  <strong>GitHub repos for agents — no clone required.</strong><br>
+  Tree fetched at open. Files via CDN on access. Search via GitHub Code Search.<br>
+  Local clone only when you write.
 </p>
 
 ---
 
-A drop-in replacement for `git sparse-checkout` that requires zero configuration. Instead of defining patterns upfront, `glimpse` mounts your repo with FUSE and lazily serves files from the Git object store **entirely from memory**. Files only materialize to disk when you write to them — reads never touch disk.
+`glimpse` is an MCP server that gives AI agents fast read access to any `github.com` repository without cloning. The repository tree is fetched in one API call. Files stream from `raw.githubusercontent.com` on demand and are cached in memory. Search is delegated to GitHub's Code Search and the candidate files are downloaded in parallel for local regex matching. Writes lazily provision a partial bare clone and a sparse worktree.
 
-**The result:** clone a 10GB monorepo, mount it, and start working in seconds. Only the files you *edit* ever hit disk.
+## Why
 
-## Why?
-
-| | `git checkout` | `git sparse-checkout` | `glimpse` |
+| | `git clone` | `--filter=blob:none` | `glimpse` |
 |---|---|---|---|
-| Time to first file access | O(repo size) | O(sparse set size) | **O(1)** |
-| Disk usage | Full working tree | Sparse subset | **Only edited files** |
-| Configuration needed | None | Cone/pattern rules | **None** |
-| Adapts to your workflow | No | No (manual pattern updates) | **Yes** |
-| Agent integration | None | None | **MCP server** |
+| Time to first read | minutes | seconds + per-file fetch | **~300 ms (one API call)** |
+| Disk for read-only browsing | full repo | partial pack | **0** |
+| Grep | local | per-blob promisor fetches | **GitHub Code Search + targeted CDN fetches** |
+| Survives offline | yes | yes (after fetches) | no |
+| Hosts supported | any | any | **github.com only** |
 
-Sparse checkout makes you answer *"what files do I need?"* before you start working. glimpse figures it out automatically by watching what you access.
+If you only ever need to read and search, glimpse never touches your disk. Clone only happens when an agent calls `write_file` or `git_commit`.
 
-## How It Works
-
-```
-┌─────────────────────────────────────────────┐
-│              Your workflow                   │
-│  ls, cat, vim, grep, go build, etc.         │
-└──────────────────────┬──────────────────────┘
-                       │
-┌──────────────────────┴──────────────────────┐
-│            FUSE Layer (glimpse)                 │
-│                                              │
-│  On first READ:                              │
-│  1. Fetch blob from git object store         │
-│  2. Cache in memory (zero disk I/O)          │
-│  3. Serve all future reads from cache        │
-│                                              │
-│  On first WRITE:                             │
-│  4. Flush cached blob to real worktree       │
-│  5. Update sparse-checkout                   │
-│  6. All future access goes to disk           │
-└──────────────────────┬──────────────────────┘
-                       │
-          ┌────────────┼────────────┐
-          │            │            │
-  ┌───────┴──────┐ ┌───┴───┐ ┌─────┴──────┐
-  │  Git Trees   │ │ Blobs │ │ Worktree   │
-  │  (lazy dirs) │ │ (ODB) │ │ (on write) │
-  └──────────────┘ └───────┘ └────────────┘
-```
-
-### The Flow
-
-1. You clone with `--sparse` (or `glimpse` sets up sparse-checkout for you)
-2. `glimpse` overlays FUSE on the worktree
-3. **Directories** resolve instantly from git tree objects
-4. **File reads** are served from an in-memory cache — zero disk I/O
-5. **File writes** trigger materialization to the real worktree + sparse-checkout
-6. Once materialized, the file is a **real file** — FUSE gets out of the way
-7. **All git commands work natively** for edited files
-
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/sumanthrao/glimpse.git
-cd glimpse
-
-go build -o glimpse .               # CLI (no dependencies beyond Go + git)
-go build -o glimpse-mcp ./cmd/glimpse-mcp  # MCP server for AI agents
+go install github.com/sumanthrao/glimpse/cmd/glimpse-mcp@latest
 ```
 
-No FUSE, no system packages, no kernel extensions. Just Go and git.
-
-> **Optional:** If you want a FUSE filesystem mount, build `go build -o glimpse-fuse ./cmd/glimpse-fuse` (requires [macFUSE](https://osxfuse.github.io/) on macOS or FUSE3 on Linux).
-
-## Usage
-
-### Browse any repo — remote URL or local path
+Print a ready-to-paste MCP config:
 
 ```bash
-# List files in a remote repo (bare-clones on first use, cached after)
-glimpse https://github.com/org/monorepo.git
-
-# Read a file
-glimpse https://github.com/org/monorepo.git cat src/main.go
-
-# Search across the repo
-glimpse https://github.com/org/monorepo.git grep "handleAuth"
-
-# Drill into a directory
-glimpse https://github.com/org/monorepo.git ls src/services/
-
-# SSH URLs work too
-glimpse git@github.com:org/repo.git cat README.md
+glimpse-mcp --print-mcp-config
 ```
 
-### From inside a local repo
+## Wire it up
 
-```bash
-cd ~/repos/big-monorepo
-
-glimpse ls src/
-glimpse cat src/services/auth/handler.go
-glimpse grep "TODO" src/
-```
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `glimpse <repo> ls [path]` | List files and directories |
-| `glimpse <repo> cat <file>` | Print file contents |
-| `glimpse <repo> grep <pattern> [path]` | Search file contents |
-| `glimpse <repo> serve` | Start MCP server for AI agents |
-
-Remote repos are bare-cloned into `~/.cache/glimpse/` and reused across sessions.
-
-## Agent Integration (MCP Server)
-
-The MCP server lets AI agents glimpse into repos directly from the git object store. **Zero external dependencies** — just the Go stdlib and the `git` CLI.
-
-### Quick Setup
-
-```bash
-go build -o glimpse-mcp ./cmd/glimpse-mcp
-```
-
-### Two Modes
-
-**Single repo** — lock to one repo at startup (backward compatible):
-
-```bash
-glimpse-mcp --repo /path/to/repo --index
-```
-
-**Multi repo** — one server, any repo on demand. Agents call `open_repo` with a URL or path. Repos are bare-cloned into `~/.cache/glimpse/` and reused across sessions:
-
-```bash
-glimpse-mcp
-```
-
-Then the agent calls:
-```
-open_repo(url: "https://github.com/org/repo.git")
-```
-
-The server bare-clones, builds a trigram index, and is ready in seconds. Subsequent opens of the same URL skip the clone entirely.
-
-### Claude Code
+### Cursor — `.cursor/mcp.json`
 
 ```json
 {
   "mcpServers": {
     "glimpse": {
-      "command": "/path/to/glimpse-mcp"
+      "command": "glimpse-mcp",
+      "env": { "GITHUB_TOKEN": "ghp_..." }
     }
   }
 }
 ```
 
-### Cursor
+### Claude Desktop / Code
 
-Add to `.cursor/mcp.json`:
+Same shape, in `claude_desktop_config.json`.
 
-```json
-{
-  "mcpServers": {
-    "glimpse": {
-      "command": "/path/to/glimpse-mcp"
-    }
-  }
-}
-```
+`GITHUB_TOKEN` is optional but raises Code Search from 10 → 30 req/min and REST from 60 → 5000 req/hr. Strongly recommended for sustained agent use.
 
-### MCP Server Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--repo` | *(optional)* | Lock to one repo at startup |
-| `--ref` | `HEAD` | Git ref to serve |
-| `--index` | `false` | Build trigram index on startup (always on for `open_repo`) |
-| `--cache-dir` | `~/.cache/glimpse` | Where to store bare clones |
-
-### Tools
-
-| Tool | Description |
-|------|-------------|
-| `open_repo(url, ref?)` | Open a repo by URL (bare-cloned, cached) or local path. Builds trigram index automatically. |
-| `list_directory(path?)` | List entries with sizes (cached) |
-| `read_file(path)` | Read file from object store (cached in memory) |
-| `write_file(path, content)` | Write file — creates a sparse worktree on first write for bare clones |
-| `file_info(path)` | Size, type, mode (cached) |
-| `grep(pattern, path?)` | Search contents — sub-10ms with trigram index |
-| `git_status()` | Show which files the agent has changed |
-| `git_diff(path?)` | Unified diff of agent's changes against HEAD |
-| `git_commit(message)` | Stage and commit only the agent's changes |
-
-### Try It
-
-```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
-{"jsonrpc":"2.0","method":"notifications/initialized"}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_directory","arguments":{"path":""}}}' \
-| ./glimpse-mcp --repo . 2>/dev/null | tail -1 \
-| python3 -c "import sys,json; print(json.load(sys.stdin)['result']['content'][0]['text'])"
-```
-
-## How It Compares
-
-### vs `git sparse-checkout`
-
-- **No patterns to maintain.** Sparse checkout requires `git sparse-checkout set src/ docs/` and manual updates. glimpse adapts automatically.
-- **Full tree visibility.** With sparse checkout, `ls` only shows files in your sparse set. With glimpse, you can browse and grep the entire tree.
-- **Same git integration.** Both result in real files on disk that work with `git status`, `git diff`, and `git commit`.
-
-### vs `git clone --depth`
-
-- Shallow clones limit history, not breadth. You still check out every file.
-- glimpse limits breadth (only edited files materialize) without limiting history.
-
-### vs VFS for Git (Microsoft)
-
-- VFS for Git (formerly GVFS) is a similar concept built for Windows + Azure DevOps.
-- glimpse is cross-platform, works with any git remote, and is a single binary with no daemon.
-
-## Running Tests
-
-```bash
-go test ./... -v
-```
-
-## Project Structure
+## Agent workflow
 
 ```
-glimpse/
-├── main.go                  # CLI (ls, cat, grep — no FUSE, no deps)
-├── cmd/
-│   ├── glimpse-mcp/
-│   │   └── main.go          # MCP server (zero deps, stdlib + git CLI)
-│   └── glimpse-fuse/
-│       └── main.go          # Optional FUSE mount (requires macFUSE/FUSE3)
-├── gitbackend/
-│   ├── backend.go           # Git object store access via go-git (used by FUSE)
-│   └── backend_test.go
-├── fusefs/
-│   ├── fs.go                # FUSE root, directory nodes, lazy tree population
-│   ├── file.go              # In-memory blob cache + materialize-on-write
-│   └── sparse.go            # Sparse-checkout integration
-├── assets/
-│   └── glimpse-logo.png
-├── go.mod
-└── README.md
+1. open_repo("https://github.com/owner/repo")
+2. find_files / list_directory   -> explore (free, no network)
+3. read_file                     -> fetch one file (CDN, ~100 ms)
+4. grep                          -> Code Search + parallel fetch + local regex
+5. write_file / git_*            -> triggers one-time partial clone (~5 s)
 ```
 
-## Technical Details
+The MCP server's `initialize.instructions` carries this workflow into the agent's system prompt so it routes to the right tool without trial and error.
 
-### Dependencies
+## Tools
 
-**FUSE filesystem:**
-- [go-fuse](https://github.com/hanwen/go-fuse) (v2) — High-performance FUSE bindings for Go
-- [go-git](https://github.com/go-git/go-git) (v5) — Pure Go git implementation (no C dependencies)
+| Tool | Cost | Use when |
+|------|------|----------|
+| `open_repo(url, ref?)` | 1 Trees API call (~300 ms) | Start of every session |
+| `list_directory(path?)` | free | Browsing |
+| `find_files(pattern, path?)` | free | Searching by filename |
+| `file_info(path)` | free | Size / type / mode |
+| `read_file(path)` | 1 CDN fetch cold; cached after | Reading a known file |
+| `grep(pattern, path?)` | 1 Code Search + parallel CDN | Searching content; prefer literal anchors (3+ chars) |
+| `repo_status()` | free | Cache state, index size, rate limits |
+| `write_file(path, content)` | triggers lazy clone first time only | Editing |
+| `git_status` / `git_diff` / `git_commit` | local after clone | Git ops on agent changes |
+| `glimpse_help()` | free | Quick reference |
 
-**MCP server:**
-- None. Just the Go standard library and `git` on your PATH.
+Every tool result includes a cost hint and, when something's incomplete, a suggested next step.
 
-### Design Decisions
+## Performance
 
-- **Pure Go.** No CGo, no libgit2. Builds anywhere Go does.
-- **Hybrid in-memory/disk.** Reads are served from an in-memory blob cache — zero disk I/O for browsing, grepping, and building. Files only materialize to the real worktree when you write to them.
-- **Materialize on write, then get out of the way.** Once a file is flushed to disk (triggered by a write), FUSE delegates to the real file. No ongoing overhead.
-- **Zero-dep MCP server.** The agent integration server uses only the Go stdlib and the `git` CLI — no go-git, no mcp-go, no FUSE. Builds instantly, runs anywhere.
-- **Trigram index.** With `--index`, the MCP server builds an in-memory trigram index on startup (like [zoekt](https://github.com/sourcegraph/zoekt)). Grep narrows candidates via posting list intersection before doing a regexp match — sub-10ms for most queries.
-- **Ephemeral mode.** With `--ephemeral`, sparse-checkout setup is skipped entirely — ideal for AI agent sessions or CI pipelines where nothing needs to persist.
+For a typical 200 MB / 10 k file repo:
 
-## Known Limitations
+| | Cold | Warm |
+|---|---|---|
+| `open_repo` | ~300 ms (1 API call) | ~300 ms (refresh) |
+| `list_directory`, `find_files`, `file_info` | < 1 ms | < 1 ms |
+| `read_file` | ~100 ms | < 1 ms |
+| `grep` literal-only | ~500 ms (Code Search snippets) | ~500 ms |
+| `grep` regex with literals | ~1–2 s (Code Search + N parallel fetches) | < 10 ms (working set in RAM) |
+| `write_file` (first call) | ~2–8 s (lazy partial clone) | < 5 ms |
 
-### FUSE mode: `extensions.worktreeConfig`
+Disk footprint stays at zero until a write happens.
 
-The FUSE filesystem uses [go-git](https://github.com/go-git/go-git), which doesn't support the `extensions.worktreeConfig` git extension. Many large monorepos (especially those using `git worktree`) enable this extension, causing glimpse FUSE mode to fail on open.
+## How it works
 
-**Workaround:** Use the MCP server instead — it shells out to the native `git` CLI and handles all extensions correctly.
+```mermaid
+flowchart LR
+  Open["open_repo(url)"] --> Tree["GET trees?recursive=1"]
+  Tree --> TreeMap["local tree map"]
 
-**Status:** Upstream go-git limitation. The long-term fix is to either patch go-git or migrate the FUSE backend to use the git CLI (like the MCP server already does).
+  Read["read_file / FUSE Read / grep candidate"] --> Access["AccessFile(path)"]
+  Access --> Cache{"RAM cache?"}
+  Cache -- yes --> Done1[bytes]
+  Cache -- no --> Disk{"on disk?"}
+  Disk -- yes --> Read1[disk read]
+  Disk -- no --> CDN[parallel raw URL fetch]
+  Read1 --> Idx[IncrementalIndex]
+  CDN --> Idx
+  Idx --> Done2[bytes]
+
+  Grep["grep(pattern)"] --> Lits[extract literals]
+  Lits --> CS[Code Search]
+  CS --> AccessBatch[AccessFile in parallel]
+  AccessBatch --> LocalRe[regex locally]
+
+  Write["write_file"] --> Clone[lazy partial clone + worktree]
+  Clone --> WriteDisk[write to disk]
+```
+
+The bridge is `Backend.AccessFile(path) -> []byte`. Every caller (read, FUSE, grep) goes through it. Every byte returned is added to a working-set trigram index keyed by blob SHA, so regex queries with no literal anchors still work over files the agent has already touched.
+
+## Limitations
+
+- **GitHub only.** Non-github URLs are rejected.
+- **Code Search has indexing lag.** Recent commits may not be searchable for a few minutes. After a write, `git grep` over the lazy worktree is the fallback for "find my own changes".
+- **Code Search excludes files >384 KB and some forks.** Once the agent reads such a file, the working-set index covers it.
+- **Trees API caps at 100k entries.** Monorepos beyond that aren't supported in v1.
+- **Network required for cold reads.** No offline mode.
+- **Rate limits without a token are tight.** Set `GITHUB_TOKEN` for sustained agent use.
 
 ## License
 
