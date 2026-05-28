@@ -5,42 +5,97 @@
 <h1 align="center">glimpse</h1>
 
 <p align="center">
-  <strong>GitHub repos for agents — no clone required.</strong><br>
-  Tree fetched at open. Files via CDN on access. Search via GitHub Code Search.<br>
-  Local clone only when you write.
+  <strong>A git explorer harness for AI agents.</strong><br>
+  Super-fast git file explorer with trigram indexing and lazy loading,<br>
+  and a FUSE-mount-backed lazy materializer for writes,<br>
+  backed by the remote git object store.
 </p>
 
 ---
 
-`glimpse` is an MCP server that gives AI agents fast read access to any `github.com` repository without cloning. The repository tree is fetched in one API call. Files stream from `raw.githubusercontent.com` on demand and are cached in memory. Search is delegated to GitHub's Code Search and the candidate files are downloaded in parallel for local regex matching. Writes lazily provision a partial bare clone and a sparse worktree.
-
 ## Why
 
-| | `git clone` | `--filter=blob:none` | `glimpse` |
-|---|---|---|---|
-| Time to first read | minutes | seconds + per-file fetch | **~300 ms (one API call)** |
-| Disk for read-only browsing | full repo | partial pack | **0** |
-| Grep | local | per-blob promisor fetches | **GitHub Code Search + targeted CDN fetches** |
-| Survives offline | yes | yes (after fetches) | no |
-| Hosts supported | any | any | **github.com only** |
+Most agentic coding tasks need only **read** access — exploring, searching,
+understanding a repo before deciding what (if anything) to change. The default
+path is `git clone`, which writes the whole repo to disk before the agent has
+decided what to look at. That's slow for short-lived sessions, wasteful for
+read-only ones, and an outright non-starter for repos too big to fit on the
+disk you have.
 
-If you only ever need to read and search, glimpse never touches your disk. Clone only happens when an agent calls `write_file` or `git_commit`.
+glimpse keeps the read path **in memory and index-based**. The repository tree
+comes back in one API call; files stream from the GitHub CDN lazily, on first
+touch, and are deduped in RAM by blob SHA. The resident working set tracks
+what the agent actually looked at — not the full repo — so on average memory
+and disk stay small even on huge codebases.
 
-## Install
+When modification *is* needed, glimpse provisions a partial bare clone
+(`--filter=blob:none`) and a FUSE-mount-backed **sparse** worktree on demand.
+Only the files the agent actually edits get materialized on disk. The
+worktree is a real git worktree, so every git API — `status`, `diff`,
+`commit`, `push`, `rebase`, anything else — keeps working without any special
+integration.
 
-```bash
-go install github.com/sumanthrao/glimpse/cmd/glimpse-mcp@latest
+The visual version:
+
+```
+git clone <url>            # minutes, full repo on disk
+cd <repo>                  # navigate
+cat / grep / read files    # fast, but everything is already on disk
+edit + commit              # fast
 ```
 
-Print a ready-to-paste MCP config:
+`glimpse` collapses it to:
 
-```bash
-glimpse-mcp --print-mcp-config
+```
+glimpse <url>              # ~300 ms, zero bytes on disk
+ls / cat / grep            # files stream on demand from a CDN
+edit + commit              # first edit lazily provisions a tiny worktree
 ```
 
-## Wire it up
+Same mental model, none of the upfront cost.
 
-### Cursor — `.cursor/mcp.json`
+## Workflows
+
+### 1. Browse a repo you've never seen
+
+```bash
+glimpse ls   https://github.com/torvalds/linux
+glimpse cat  https://github.com/torvalds/linux MAINTAINERS
+glimpse grep https://github.com/torvalds/linux 'EXPORT_SYMBOL_GPL'
+```
+
+No clone. No checkout. The tree shows up in ~300 ms; each file you read takes ~100 ms once.
+
+### 2. Browse a monorepo too big for the GitHub Trees API
+
+GitHub's Trees API caps a recursive tree response at ~7 MB / ~100k entries. For a small repo that's fine; for something the size of `snowflake-eng/snowflake` (51k+ entries truncated at the top level) it isn't.
+
+Pin to the subdirectory you actually care about by appending `/tree/<branch>/<path>` to the URL:
+
+```bash
+glimpse ls   'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations'
+glimpse find 'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations' 'SKILL.md'
+glimpse grep 'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations' 'cloudprober'
+glimpse cat  'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations' \
+             'teams/spcs/skills/spcs-ops/spcs-prober-debug/SKILL.md'
+```
+
+Paths in command output are relative to the pinned subtree, so the user model is the same as if `AIOperations/` were a tiny repo of its own. If even the pinned subtree exceeds the cap, glimpse warns on stderr and proceeds with the partial tree it did receive.
+
+### 3. Mount it as a real filesystem
+
+```bash
+glimpse-fuse https://github.com/torvalds/linux --mount ./linux
+ls   ./linux                            # tree from memory
+cat  ./linux/Documentation/README       # CDN fetch, cached
+echo "..." >> ./linux/MAINTAINERS       # first write -> lazy worktree
+```
+
+Any tool that opens files (`grep`, `rg`, `vim`, your IDE) just works against the mount. Reads are lazy; writes flip the affected file to disk-backed.
+
+### 4. Drop it into Cursor / Claude as an MCP server
+
+The agent gets `open_repo`, `read_file`, `grep`, `write_file`, `git_status`, `git_diff`, `git_commit`, plus `find_files`, `repo_status`, `glimpse_help`. Each tool result carries a cost hint and a next-step suggestion.
 
 ```json
 {
@@ -53,92 +108,85 @@ glimpse-mcp --print-mcp-config
 }
 ```
 
-### Claude Desktop / Code
+`glimpse-mcp --print-mcp-config` prints the snippet for you to paste.
 
-Same shape, in `claude_desktop_config.json`.
+`open_repo` accepts the same `/tree/<branch>/<path>` form as the CLI, so an agent can pin to a subtree without any extra arguments.
 
-`GITHUB_TOKEN` is optional but raises Code Search from 10 → 30 req/min and REST from 60 → 5000 req/hr. Strongly recommended for sustained agent use.
+## Benchmarks
 
-## Agent workflow
+Measured on a wired residential connection from the US west coast, against
+`api.github.com` and `raw.githubusercontent.com`. All glimpse runs use a fresh
+cache directory so reads are honest cold fetches. All `git` runs are
+`git clone --depth=1` (the most generous baseline for read-only browsing) plus
+a follow-up `git grep`. Reproducer: [`scripts/bench.sh`](scripts/bench.sh).
 
-```
-1. open_repo("https://github.com/owner/repo")
-2. find_files / list_directory   -> explore (free, no network)
-3. read_file                     -> fetch one file (CDN, ~100 ms)
-4. grep                          -> Code Search + parallel fetch + local regex
-5. write_file / git_*            -> triggers one-time partial clone (~5 s)
-```
+Three columns of wall-clock seconds:
+- **t_tree** — time until the directory listing is printable
+- **t_cat** — time until the first file's contents are printable (for `git`,
+  the file is on disk after `clone`, so this equals `t_clone`)
+- **t_grep** — time until the first grep result is printable, starting from
+  no local state (so for `git` this includes the clone)
 
-The MCP server's `initialize.instructions` carries this workflow into the agent's system prompt so it routes to the right tool without trial and error.
+| repo | tool | t_tree | t_cat | t_grep | disk after |
+|---|---|---:|---:|---:|---:|
+| `cli/cli` | **glimpse** | **1.74 s** | **1.38 s** | **1.75 s** | **0** |
+| `cli/cli` | git --depth=1 | 3.70 s | 3.70 s | 3.91 s | 39 MB |
+| `hashicorp/terraform` | **glimpse** | **1.63 s** | **1.74 s** | **2.50 s** | **0** |
+| `hashicorp/terraform` | git --depth=1 | 6.08 s | 6.08 s | 6.36 s | 48 MB |
+| `torvalds/linux` | **glimpse** | **3.06 s** | **2.93 s** | **3.46 s** | **0** |
+| `torvalds/linux` | git --depth=1 | 59.7 s | 59.7 s | 64.7 s | 2.0 GB |
+| `snowflake-eng/snowflake/tree/main/AIOperations` | **glimpse** | **2.03 s** | **2.15 s** | **3.35 s** | **0** |
+| (same, full repo)     | git --depth=1 | (would need ≈ 22 GB on disk; not attempted) |
 
-## Tools
+Speedup factors of glimpse vs `git clone --depth=1`:
 
-| Tool | Cost | Use when |
-|------|------|----------|
-| `open_repo(url, ref?)` | 1 Trees API call (~300 ms) | Start of every session |
-| `list_directory(path?)` | free | Browsing |
-| `find_files(pattern, path?)` | free | Searching by filename |
-| `file_info(path)` | free | Size / type / mode |
-| `read_file(path)` | 1 CDN fetch cold; cached after | Reading a known file |
-| `grep(pattern, path?)` | 1 Code Search + parallel CDN | Searching content; prefer literal anchors (3+ chars) |
-| `repo_status()` | free | Cache state, index size, rate limits |
-| `write_file(path, content)` | triggers lazy clone first time only | Editing |
-| `git_status` / `git_diff` / `git_commit` | local after clone | Git ops on agent changes |
-| `glimpse_help()` | free | Quick reference |
+| repo | t_tree | t_cat | t_grep | disk |
+|---|---:|---:|---:|---:|
+| `cli/cli`            | 2.1× | 2.7× | 2.2× | ∞ (39 MB → 0) |
+| `hashicorp/terraform` | 3.7× | 3.5× | 2.5× | ∞ (48 MB → 0) |
+| `torvalds/linux`     | **19.5×** | **20.4×** | **18.7×** | **∞ (2.0 GB → 0)** |
+| monorepo subtree     | n/a (git can't fit on disk) | | | |
 
-Every tool result includes a cost hint and, when something's incomplete, a suggested next step.
+Takeaways:
 
-## Performance
+- **Time to browse scales sub-linearly** with repo size: ~2 s for a small CLI,
+  ~3 s for the Linux kernel. `git clone --depth=1` scales linearly with repo
+  size: about a minute for the kernel.
+- **Tree + first-read together** in glimpse beats the TCP handshake budget of
+  `git clone` on every repo we measured, and is ~20× faster on the kernel.
+- **Grep is now competitive on every size class.** Code Search + parallel CDN
+  fetch beats `git clone --depth=1 && git grep` even on small repos because
+  the bottleneck for the baseline is always the clone, not the grep.
+- **Subtree pinning makes monorepos work at all.** glimpse navigates inside
+  `snowflake-eng/snowflake/AIOperations` in ~2 s without ever touching the
+  ~22 GB the full repo would require to clone.
+- **Disk used for read-only browsing is always 0.** Nothing materializes until
+  the first `write_file` triggers the lazy partial clone.
 
-For a typical 200 MB / 10 k file repo:
+These numbers reflect a recent optimization: at session open, glimpse fires
+the tree fetch, the repo metadata fetch, and the languages fetch in parallel
+(they were sequential before), and reuses the metadata fetched during ref
+resolution. That alone shaved 2–4 seconds off the kernel cold open and made
+grep ~2× faster across the board.
 
-| | Cold | Warm |
-|---|---|---|
-| `open_repo` | ~300 ms (1 API call) | ~300 ms (refresh) |
-| `list_directory`, `find_files`, `file_info` | < 1 ms | < 1 ms |
-| `read_file` | ~100 ms | < 1 ms |
-| `grep` literal-only | ~500 ms (Code Search snippets) | ~500 ms |
-| `grep` regex with literals | ~1–2 s (Code Search + N parallel fetches) | < 10 ms (working set in RAM) |
-| `write_file` (first call) | ~2–8 s (lazy partial clone) | < 5 ms |
+## Install
 
-Disk footprint stays at zero until a write happens.
-
-## How it works
-
-```mermaid
-flowchart LR
-  Open["open_repo(url)"] --> Tree["GET trees?recursive=1"]
-  Tree --> TreeMap["local tree map"]
-
-  Read["read_file / FUSE Read / grep candidate"] --> Access["AccessFile(path)"]
-  Access --> Cache{"RAM cache?"}
-  Cache -- yes --> Done1[bytes]
-  Cache -- no --> Disk{"on disk?"}
-  Disk -- yes --> Read1[disk read]
-  Disk -- no --> CDN[parallel raw URL fetch]
-  Read1 --> Idx[IncrementalIndex]
-  CDN --> Idx
-  Idx --> Done2[bytes]
-
-  Grep["grep(pattern)"] --> Lits[extract literals]
-  Lits --> CS[Code Search]
-  CS --> AccessBatch[AccessFile in parallel]
-  AccessBatch --> LocalRe[regex locally]
-
-  Write["write_file"] --> Clone[lazy partial clone + worktree]
-  Clone --> WriteDisk[write to disk]
+```bash
+git clone https://github.com/surao/gitfs-accelerator
+cd gitfs-accelerator
+go build -o glimpse        .                       # CLI
+go build -o glimpse-mcp    ./cmd/glimpse-mcp       # MCP server
+go build -o glimpse-fuse   ./cmd/glimpse-fuse      # optional FUSE mount
 ```
 
-The bridge is `Backend.AccessFile(path) -> []byte`. Every caller (read, FUSE, grep) goes through it. Every byte returned is added to a working-set trigram index keyed by blob SHA, so regex queries with no literal anchors still work over files the agent has already touched.
+Drop the binaries somewhere on `PATH`.
 
-## Limitations
+## Notes
 
-- **GitHub only.** Non-github URLs are rejected.
-- **Code Search has indexing lag.** Recent commits may not be searchable for a few minutes. After a write, `git grep` over the lazy worktree is the fallback for "find my own changes".
-- **Code Search excludes files >384 KB and some forks.** Once the agent reads such a file, the working-set index covers it.
-- **Trees API caps at 100k entries.** Monorepos beyond that aren't supported in v1.
-- **Network required for cold reads.** No offline mode.
-- **Rate limits without a token are tight.** Set `GITHUB_TOKEN` for sustained agent use.
+- Only `github.com` URLs are supported. Other hosts return an error.
+- Set `GITHUB_TOKEN` (env or `--github-token`) for higher rate limits and private repos. Without one: 60 REST req/hr, 10 Code Search req/min.
+- Subtree pinning (`/tree/<branch>/<path>`) is the recommended way to use glimpse on monorepos. The session is pinned to that subtree; relative paths in `ls` / `cat` / `grep` are relative to it.
+- `repo_status` surfaces cache state, working-set index size, rate-limit headroom, and whether the tree was truncated.
 
 ## License
 
