@@ -60,11 +60,15 @@ type Backend struct {
 
 	idx *IncrementalIndex
 
-	// Lazy clone state for writes.
+	// Lazy clone state for disk-backed writes.
 	cloneOnce sync.Once
 	cloneErr  error
 	bareDir   string
 	wtDir     string
+
+	// Diskless API write state (no disk, no git CLI).
+	apiMu     sync.Mutex
+	apiWrites *apiWriteState
 
 	// Stats counters (atomic).
 	blobsFetched atomic.Int64

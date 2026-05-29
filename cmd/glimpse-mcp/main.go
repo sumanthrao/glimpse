@@ -285,6 +285,34 @@ func toolDefs() []toolDef {
 			},
 		},
 		{
+			Name: "write_file_api",
+			Description: "Stage a file write in memory (diskless). Does NOT touch disk or clone. " +
+				"Use git_push_api to commit and push all staged files at once via the GitHub API. " +
+				"Ideal for quick edits on repos you have push access to.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":    str("Path relative to repo root (or subtree)."),
+					"content": str("Full file content."),
+				},
+				"required": []string{"path", "content"},
+			},
+		},
+		{
+			Name: "git_push_api",
+			Description: "Commit all files staged via write_file_api and push to GitHub, entirely through the API. " +
+				"No disk, no git CLI, no clone. Creates the branch if it doesn't exist. " +
+				"Non-force-push: fails if the branch has moved since open_repo.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"message": str("Commit message. Required."),
+					"branch":  str("Target branch. Defaults to the branch the repo was opened at."),
+				},
+				"required": []string{"message"},
+			},
+		},
+		{
 			Name: "repo_status",
 			Description: "Show backend state: ref, file count, working-set index, cache hits, GitHub rate limits, worktree provisioned. Cost: free. " +
 				"Use when something seems off (rate limited? big repo?) or to verify session state.",
@@ -304,14 +332,21 @@ func toolDefs() []toolDef {
 	}
 }
 
-const agentInstructions = `glimpse: read & search any github.com repo without cloning, then write through a lazy worktree.
+const agentInstructions = `glimpse: read & search any github.com repo without cloning, then write via API or worktree.
 
 Workflow:
   1. open_repo("https://github.com/owner/repo")  -> required first call
   2. find_files / list_directory                 -> free, in-memory navigation
   3. read_file                                   -> CDN fetch, ~100 ms cold, cached
   4. grep                                        -> Code Search + parallel fetch
-  5. write_file / git_status / git_diff / git_commit -> first write triggers a one-time clone
+  5a. DISKLESS writes (preferred for small edits):
+      write_file_api(path, content)              -> stages in RAM, zero disk IO
+      git_push_api(message, branch)              -> commits+pushes via GitHub API
+  5b. DISK writes (full git worktree, for complex workflows):
+      write_file / git_status / git_diff / git_commit -> first write triggers a one-time clone
+
+Choose 5a (diskless) when you need a quick edit+push and have API write access.
+Choose 5b (worktree) when you need git rebase, interactive staging, or local tools.
 
 Subtree pinning (use this on monorepos):
   open_repo("https://github.com/owner/repo/tree/<branch>/<path>")
@@ -367,6 +402,7 @@ func (s *server) dispatch(raw json.RawMessage) toolResult {
 		Pattern string `json:"pattern"`
 		Content string `json:"content"`
 		Message string `json:"message"`
+		Branch  string `json:"branch"`
 	}
 	if len(p.Arguments) > 0 {
 		_ = json.Unmarshal(p.Arguments, &args)
@@ -388,6 +424,10 @@ func (s *server) dispatch(raw json.RawMessage) toolResult {
 		return grep(ctx, be, args.Pattern, args.Path)
 	case "write_file":
 		return writeFile(ctx, be, args.Path, args.Content)
+	case "write_file_api":
+		return writeFileAPI(be, args.Path, args.Content)
+	case "git_push_api":
+		return gitPushAPI(ctx, be, args.Message, args.Branch)
 	case "git_status":
 		return gitStatus(ctx, be)
 	case "git_diff":
@@ -662,6 +702,46 @@ func gitCommit(ctx context.Context, be *gitbackend.Backend, msg string) toolResu
 		return errResult("git commit: " + err.Error() + ": " + string(commitOut))
 	}
 	return textResult(strings.TrimRight(string(commitOut), "\n"))
+}
+
+func writeFileAPI(be *gitbackend.Backend, p, content string) toolResult {
+	p = gitbackend.NormalizePath(p)
+	if p == "" {
+		return errResult("path is required.")
+	}
+	if err := be.WriteFileAPI(p, []byte(content)); err != nil {
+		return errResult("write_file_api: " + err.Error())
+	}
+	pending := be.PendingFiles()
+	return jsonResult(map[string]any{
+		"path":           p,
+		"size":           len(content),
+		"staged":         true,
+		"pending_count":  len(pending),
+		"pending_files":  pending,
+		"cost":           "free (in-memory only)",
+		"next_steps":     []string{"write_file_api for more files", "git_push_api(message, branch) to commit+push all"},
+	})
+}
+
+func gitPushAPI(ctx context.Context, be *gitbackend.Backend, message, branch string) toolResult {
+	if message == "" {
+		return errResult("message is required.")
+	}
+	start := time.Now()
+	result, err := be.CommitAndPush(ctx, message, branch)
+	if err != nil {
+		return errResult("git_push_api: " + err.Error())
+	}
+	return jsonResult(map[string]any{
+		"ok":         true,
+		"commit_sha": result.CommitSHA,
+		"tree_sha":   result.TreeSHA,
+		"branch":     result.Branch,
+		"elapsed_ms": time.Since(start).Milliseconds(),
+		"cost":       "4 API calls (create blobs + tree + commit + update ref)",
+		"note":       "Pushed via GitHub API. No disk, no clone, no git CLI used.",
+	})
 }
 
 func repoStatus(be *gitbackend.Backend) toolResult {

@@ -82,7 +82,27 @@ glimpse cat  'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations'
 
 Paths in command output are relative to the pinned subtree, so the user model is the same as if `AIOperations/` were a tiny repo of its own. If even the pinned subtree exceeds the cap, glimpse warns on stderr and proceeds with the partial tree it did receive.
 
-### 3. Mount it as a real filesystem
+### 3. Edit and push without touching disk (API writes)
+
+```bash
+# Write a single file and push in one shot:
+echo '{"version": 2}' | glimpse write https://github.com/you/repo config.json -
+
+# Multi-file commit:
+glimpse push https://github.com/you/repo \
+  --message "update configs" --branch my-branch \
+  config.json:./local-config.json \
+  docs/setup.md:./setup.md
+```
+
+Zero disk usage, zero clone, zero FUSE. glimpse creates blobs, assembles a tree,
+creates a commit, and fast-forwards the branch ref entirely through the GitHub
+Git Data API. If the branch doesn't exist yet, it's created automatically.
+
+The MCP tools `write_file_api` and `git_push_api` expose the same capability to
+AI agents: stage files in RAM, then commit+push with one call.
+
+### 4. Mount it as a real filesystem
 
 ```bash
 glimpse-fuse https://github.com/torvalds/linux --mount ./linux
@@ -93,9 +113,9 @@ echo "..." >> ./linux/MAINTAINERS       # first write -> lazy worktree
 
 Any tool that opens files (`grep`, `rg`, `vim`, your IDE) just works against the mount. Reads are lazy; writes flip the affected file to disk-backed.
 
-### 4. Drop it into Cursor / Claude as an MCP server
+### 5. Drop it into Cursor / Claude as an MCP server
 
-The agent gets `open_repo`, `read_file`, `grep`, `write_file`, `git_status`, `git_diff`, `git_commit`, plus `find_files`, `repo_status`, `glimpse_help`. Each tool result carries a cost hint and a next-step suggestion.
+The agent gets `open_repo`, `read_file`, `grep`, `write_file`, `write_file_api`, `git_push_api`, `git_status`, `git_diff`, `git_commit`, plus `find_files`, `repo_status`, `glimpse_help`. Each tool result carries a cost hint and a next-step suggestion. Two write paths: diskless (`write_file_api` + `git_push_api`) for quick edits via the GitHub API, or disk-backed (`write_file` + `git_commit`) for full git workflows.
 
 ```json
 {
