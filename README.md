@@ -7,7 +7,8 @@
 <p align="center">
   <strong>A git explorer harness for AI agents.</strong><br>
   Super-fast git file explorer with trigram indexing and lazy loading,<br>
-  and a FUSE-mount-backed lazy materializer for writes,<br>
+  diskless writes straight through the GitHub API,<br>
+  and a FUSE-mount-backed lazy materializer when you need a real worktree,<br>
   backed by the remote git object store.
 </p>
 
@@ -28,12 +29,19 @@ touch, and are deduped in RAM by blob SHA. The resident working set tracks
 what the agent actually looked at — not the full repo — so on average memory
 and disk stay small even on huge codebases.
 
-When modification *is* needed, glimpse provisions a partial bare clone
-(`--filter=blob:none`) and a FUSE-mount-backed **sparse** worktree on demand.
-Only the files the agent actually edits get materialized on disk. The
-worktree is a real git worktree, so every git API — `status`, `diff`,
-`commit`, `push`, `rebase`, anything else — keeps working without any special
-integration.
+When modification *is* needed, there are two paths and you pick by how much
+git you actually want:
+
+- **Diskless API writes.** For the common case — edit a few files, commit,
+  push — glimpse goes straight through the GitHub Git Data API: stage content
+  in RAM, create blobs, assemble a tree, create a commit, fast-forward the
+  branch. No clone, no worktree, no git CLI, zero bytes on disk. The branch is
+  created automatically if it doesn't exist yet.
+- **FUSE-mount-backed sparse worktree.** When you need the *full* git surface —
+  `rebase`, interactive staging, local tooling — glimpse provisions a partial
+  bare clone (`--filter=blob:none`) and a sparse worktree on demand. Only the
+  files the agent actually edits get materialized on disk, and every git API
+  keeps working without any special integration.
 
 The visual version:
 
@@ -41,7 +49,7 @@ The visual version:
 git clone <url>            # minutes, full repo on disk
 cd <repo>                  # navigate
 cat / grep / read files    # fast, but everything is already on disk
-edit + commit              # fast
+edit + commit + push       # fast
 ```
 
 `glimpse` collapses it to:
@@ -49,7 +57,7 @@ edit + commit              # fast
 ```
 glimpse <url>              # ~300 ms, zero bytes on disk
 ls / cat / grep            # files stream on demand from a CDN
-edit + commit              # first edit lazily provisions a tiny worktree
+glimpse write / push       # commit + push through the API, still zero on disk
 ```
 
 Same mental model, none of the upfront cost.
@@ -68,19 +76,19 @@ No clone. No checkout. The tree shows up in ~300 ms; each file you read takes ~1
 
 ### 2. Browse a monorepo too big for the GitHub Trees API
 
-GitHub's Trees API caps a recursive tree response at ~7 MB / ~100k entries. For a small repo that's fine; for something the size of `snowflake-eng/snowflake` (51k+ entries truncated at the top level) it isn't.
+GitHub's Trees API caps a recursive tree response at ~7 MB / ~100k entries. For a small repo that's fine; for a large monorepo (tens of thousands of entries, truncated at the top level) it isn't.
 
 Pin to the subdirectory you actually care about by appending `/tree/<branch>/<path>` to the URL:
 
 ```bash
-glimpse ls   'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations'
-glimpse find 'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations' 'SKILL.md'
-glimpse grep 'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations' 'cloudprober'
-glimpse cat  'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations' \
-             'teams/spcs/skills/spcs-ops/spcs-prober-debug/SKILL.md'
+glimpse ls   'https://github.com/your-org/monorepo/tree/main/services/api'
+glimpse find 'https://github.com/your-org/monorepo/tree/main/services/api' 'README.md'
+glimpse grep 'https://github.com/your-org/monorepo/tree/main/services/api' 'func main'
+glimpse cat  'https://github.com/your-org/monorepo/tree/main/services/api' \
+             'handlers/auth/login.go'
 ```
 
-Paths in command output are relative to the pinned subtree, so the user model is the same as if `AIOperations/` were a tiny repo of its own. If even the pinned subtree exceeds the cap, glimpse warns on stderr and proceeds with the partial tree it did receive.
+Paths in command output are relative to the pinned subtree, so the user model is the same as if `services/api/` were a tiny repo of its own. If even the pinned subtree exceeds the cap, glimpse warns on stderr and proceeds with the partial tree it did receive.
 
 ### 3. Edit and push without touching disk (API writes)
 
@@ -155,7 +163,7 @@ Three columns of wall-clock seconds:
 | `hashicorp/terraform` | git --depth=1 | 6.08 s | 6.08 s | 6.36 s | 48 MB |
 | `torvalds/linux` | **glimpse** | **3.06 s** | **2.93 s** | **3.46 s** | **0** |
 | `torvalds/linux` | git --depth=1 | 59.7 s | 59.7 s | 64.7 s | 2.0 GB |
-| `snowflake-eng/snowflake/tree/main/AIOperations` | **glimpse** | **2.03 s** | **2.15 s** | **3.35 s** | **0** |
+| large monorepo subtree (~22 GB full repo) | **glimpse** | **2.03 s** | **2.15 s** | **3.35 s** | **0** |
 | (same, full repo)     | git --depth=1 | (would need ≈ 22 GB on disk; not attempted) |
 
 Speedup factors of glimpse vs `git clone --depth=1`:
@@ -178,10 +186,11 @@ Takeaways:
   fetch beats `git clone --depth=1 && git grep` even on small repos because
   the bottleneck for the baseline is always the clone, not the grep.
 - **Subtree pinning makes monorepos work at all.** glimpse navigates inside
-  `snowflake-eng/snowflake/AIOperations` in ~2 s without ever touching the
+  a pinned subtree of a large monorepo in ~2 s without ever touching the
   ~22 GB the full repo would require to clone.
-- **Disk used for read-only browsing is always 0.** Nothing materializes until
-  the first `write_file` triggers the lazy partial clone.
+- **Disk used for read-only browsing is always 0.** And with API writes
+  (`glimpse write` / `push`), it stays 0 through commit and push too — disk is
+  only ever touched if you opt into the FUSE-backed worktree path.
 
 These numbers reflect a recent optimization: at session open, glimpse fires
 the tree fetch, the repo metadata fetch, and the languages fetch in parallel
@@ -207,6 +216,7 @@ Drop the binaries somewhere on `PATH`.
 - Set `GITHUB_TOKEN` (env or `--github-token`) for higher rate limits and private repos. Without one: 60 REST req/hr, 10 Code Search req/min.
 - Subtree pinning (`/tree/<branch>/<path>`) is the recommended way to use glimpse on monorepos. The session is pinned to that subtree; relative paths in `ls` / `cat` / `grep` are relative to it.
 - `repo_status` surfaces cache state, working-set index size, rate-limit headroom, and whether the tree was truncated.
+- Two write paths: `glimpse write` / `glimpse push` (and MCP `write_file_api` / `git_push_api`) commit through the GitHub API with no disk; `write_file` / `git_commit` use a lazy on-disk worktree for full git workflows. API writes need a token with push access and are a non-force fast-forward — if the target branch moved since you opened, re-open at that branch (`--ref <branch>`) and retry.
 
 ## License
 

@@ -397,7 +397,7 @@ Examples:
   glimpse ls    https://github.com/torvalds/linux
   glimpse cat   https://github.com/torvalds/linux README
   glimpse grep  https://github.com/torvalds/linux 'EXPORT_SYMBOL_GPL'
-  glimpse ls    'https://github.com/snowflake-eng/snowflake/tree/main/AIOperations'
+  glimpse ls    'https://github.com/your-org/monorepo/tree/main/services/api'
   glimpse write https://github.com/you/repo path/to/file.txt ./local.txt
   glimpse push  https://github.com/you/repo --message "update" a.txt:./a.txt b.txt:./b.txt
   glimpse serve   # start MCP server`)
