@@ -77,8 +77,20 @@ type server struct {
 	cacheDir string
 	token    string
 
-	mu      sync.Mutex
-	current *gitbackend.Backend
+	mu       sync.Mutex
+	current  *gitbackend.Backend
+	backends map[string]*gitbackend.Backend // owner/repo@commit -> warm backend
+}
+
+// backendKey identifies a Backend by its (owner, repo, commit) tuple. Two
+// open_repo calls that resolve to the same key share one Backend, including
+// its RAM blob cache and incremental trigram index.
+func backendKey(r gitbackend.RepoRef) string {
+	subtree := r.Subtree
+	if subtree != "" {
+		subtree = ":" + subtree
+	}
+	return r.Owner + "/" + r.Repo + "@" + r.CommitSHA + subtree
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +118,11 @@ func main() {
 		*token = os.Getenv("GITHUB_TOKEN")
 	}
 
-	srv := &server{cacheDir: *cacheDir, token: *token}
+	srv := &server{
+		cacheDir: *cacheDir,
+		token:    *token,
+		backends: make(map[string]*gitbackend.Backend),
+	}
 
 	fmt.Fprintf(os.Stderr, "glimpse-mcp %s\n", version)
 	fmt.Fprintf(os.Stderr, "  cache: %s\n", *cacheDir)
@@ -458,13 +474,47 @@ func (s *server) openRepo(rawURL, ref string) toolResult {
 	defer cancel()
 
 	start := time.Now()
-	be, err := gitbackend.Open(ctx, parsed, s.token, s.cacheDir)
+
+	// Resolve the commit SHA first so we can key the cache by repo identity
+	// rather than by user-supplied ref name. open_repo("main") and
+	// open_repo("<sha>") collapse to the same Backend when they point at the
+	// same commit, sharing the warm RAM blob cache and trigram index.
+	resolved, err := gitbackend.ResolveCommit(ctx, parsed, s.token)
 	if err != nil {
 		hint := ""
 		if strings.Contains(err.Error(), "rate limit") {
 			hint = " Set GITHUB_TOKEN to raise limits."
 		}
 		return errResult("open_repo failed: " + err.Error() + "." + hint)
+	}
+
+	key := backendKey(resolved)
+	cached := false
+
+	s.mu.Lock()
+	be, ok := s.backends[key]
+	s.mu.Unlock()
+
+	if !ok {
+		be, err = gitbackend.Open(ctx, resolved, s.token, s.cacheDir)
+		if err != nil {
+			hint := ""
+			if strings.Contains(err.Error(), "rate limit") {
+				hint = " Set GITHUB_TOKEN to raise limits."
+			}
+			return errResult("open_repo failed: " + err.Error() + "." + hint)
+		}
+		s.mu.Lock()
+		// Re-check under lock in case a concurrent open_repo raced ahead.
+		if existing, dup := s.backends[key]; dup {
+			be = existing
+			cached = true
+		} else {
+			s.backends[key] = be
+		}
+		s.mu.Unlock()
+	} else {
+		cached = true
 	}
 
 	s.mu.Lock()
@@ -486,6 +536,7 @@ func (s *server) openRepo(rawURL, ref string) toolResult {
 		"languages":  be.Languages(),
 		"open_ms":    time.Since(start).Milliseconds(),
 		"rate":       rateMap(stats.Rate),
+		"cached":     cached,
 		"next_steps": []string{"list_directory()", "find_files(\"*.go\")", "read_file(\"README.md\")", "grep(\"package main\")"},
 	}
 	if stats.Truncated {

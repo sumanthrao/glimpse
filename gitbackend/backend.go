@@ -89,9 +89,32 @@ type Backend struct {
 	truncated bool
 }
 
+// ResolveCommit fills in ref.CommitSHA (and resolves an empty Ref to the
+// repo's default branch) without fetching the tree. It's the cheap probe the
+// mux uses to key its same-process Backend cache: open_repo on a ref that
+// resolves to an already-warm commit returns the existing Backend instead of
+// paying for a fresh Trees / Languages round trip.
+//
+// If ref.CommitSHA is already populated, ResolveCommit is a no-op.
+func ResolveCommit(ctx context.Context, ref RepoRef, token string) (RepoRef, error) {
+	if ref.CommitSHA != "" {
+		return ref, nil
+	}
+	gh := newGitHubClient(token)
+	resolvedRef, sha, _, err := gh.resolveCommit(ctx, ref.Owner, ref.Repo, ref.Ref)
+	if err != nil {
+		return ref, fmt.Errorf("resolve ref: %w", err)
+	}
+	ref.Ref = resolvedRef
+	ref.CommitSHA = sha
+	return ref, nil
+}
+
 // Open fetches the tree for ref and constructs a backend. Token is optional;
 // when set, REST and Code Search rate limits go up considerably and private
 // repos become accessible.
+//
+// If ref.CommitSHA is non-empty, the commit-resolution REST call is skipped.
 func Open(ctx context.Context, ref RepoRef, token, cacheDir string) (*Backend, error) {
 	if cacheDir == "" {
 		home, _ := os.UserHomeDir()
@@ -106,13 +129,22 @@ func Open(ctx context.Context, ref RepoRef, token, cacheDir string) (*Backend, e
 	// Resolve user-supplied ref (which may be empty) to a stable commit SHA.
 	// resolvedInfo is non-nil when ref was empty — we got the repo metadata
 	// along the way and can reuse it to avoid a duplicate fetch below.
-	resolvedRef, sha, resolvedInfo, err := gh.resolveCommit(ctx, ref.Owner, ref.Repo, ref.Ref)
-	if err != nil {
-		return nil, fmt.Errorf("resolve ref: %w", err)
+	//
+	// If the caller pre-resolved (CommitSHA is set), skip the round trip;
+	// this is how the mux's same-process cache avoids paying for the
+	// commit-resolution REST call twice.
+	var resolvedInfo *repoInfo
+	if ref.CommitSHA == "" {
+		resolvedRef, sha, info, err := gh.resolveCommit(ctx, ref.Owner, ref.Repo, ref.Ref)
+		if err != nil {
+			return nil, fmt.Errorf("resolve ref: %w", err)
+		}
+		ref.Ref = resolvedRef
+		ref.CommitSHA = sha
+		resolvedInfo = info
 	}
-	ref.Ref = resolvedRef
-	ref.CommitSHA = sha
 	ref.Subtree = NormalizePath(ref.Subtree)
+	sha := ref.CommitSHA
 
 	// Choose the tree-ish SHA to fetch from. For subtree-pinned URLs we walk
 	// down from the commit's root tree to the requested directory and fetch
